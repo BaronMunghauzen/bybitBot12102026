@@ -1,565 +1,159 @@
 from __future__ import annotations
 
 import logging
-import math
-import time
-from dataclasses import dataclass
-from typing import Any
-
+from typing import Any, Dict, List, Optional
 from pybit.unified_trading import HTTP
-import pybit._helpers as pybit_helpers
-from pybit.exceptions import InvalidRequestError
-
-from bot.config import AppConfig, BybitConfig, TradingConfig
+from bot.config import AppConfig
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass
-class SymbolTicker:
-    symbol: str
-    change_pct_24h: float
-    last_price: float
-
-
-@dataclass
-class PositionInfo:
-    symbol: str
-    side: str
-    size: float
-    size_str: str
-    entry_price: float
-    mark_price: float
-    unrealised_pnl: float
-    leverage: str
-    position_value: float
-
-
-@dataclass
-class ClosedPosition:
-    symbol: str
-    side: str
-    pnl: float
-    position_value: float
-    success: bool
-    error: str | None = None
-
-
-@dataclass
-class ExecutedOrder:
-    symbol: str
-    side: str
-    qty: str
-    usdt_amount: float
-    order_id: str | None
-    success: bool
-    error: str | None = None
-    leverage: int = 0
-
-
 class BybitClient:
-    _time_offset_ms: int = 0
-    _original_generate_timestamp = pybit_helpers.generate_timestamp
-
-    def __init__(self, bybit_cfg: BybitConfig, trading_cfg: TradingConfig) -> None:
-        self.trading = trading_cfg
-        self.session = self._create_session(bybit_cfg)
-        self._sync_time_offset()
-
-    @staticmethod
-    def _create_session(cfg: BybitConfig) -> HTTP:
-        common = {
-            "api_key": cfg.api_key,
-            "api_secret": cfg.api_secret,
-            "timeout": 30,
-            "recv_window": cfg.recv_window,
-        }
-        if cfg.mode == "demo":
-            return HTTP(testnet=False, demo=True, **common)
-        if cfg.mode == "testnet":
-            return HTTP(testnet=True, demo=False, **common)
-        return HTTP(testnet=False, demo=False, **common)
+    def __init__(self, api_key: str, api_secret: str, testnet: bool = False, demo: bool = False) -> None:
+        self.session = HTTP(
+            testnet=testnet,
+            api_key=api_key,
+            api_secret=api_secret,
+            demo=demo,
+        )
 
     @classmethod
-    def _apply_time_offset(cls, offset_ms: int) -> None:
-        cls._time_offset_ms = offset_ms
-
-        def adjusted_timestamp() -> int:
-            return cls._original_generate_timestamp() + cls._time_offset_ms
-
-        pybit_helpers.generate_timestamp = adjusted_timestamp
-
-    def _sync_time_offset(self) -> None:
-        try:
-            result = self.session.get_server_time()
-            if result.get("retCode") != 0:
-                return
-
-            server_ms = int(result.get("time", 0))
-            if server_ms <= 0:
-                server_ms = int((result.get("result") or {}).get("timeSecond", 0)) * 1000
-            if server_ms <= 0:
-                return
-
-            local_ms = int(time.time() * 1000)
-            offset_ms = server_ms - local_ms
-            self._apply_time_offset(offset_ms)
-
-            skew_sec = abs(offset_ms) / 1000.0
-            if skew_sec > 1:
-                logger.warning(
-                    "System clock differs from Bybit by %.1f s. "
-                    "Applied automatic time offset for API requests. "
-                    "Also sync Windows time: Settings -> Time & language -> Sync now.",
-                    skew_sec,
-                )
-        except Exception:
-            logger.debug("Could not sync Bybit server time", exc_info=True)
-
-    def _unwrap(self, response: dict[str, Any]) -> dict[str, Any]:
-        if response.get("retCode") != 0:
-            raise RuntimeError(
-                f"Bybit API error {response.get('retCode')}: {response.get('retMsg')}"
-            )
-        return response.get("result") or {}
-
-    def get_available_balance(self) -> float:
-        result = self._unwrap(
-            self.session.get_wallet_balance(
-                accountType=self.trading.account_type,
-                coin=self.trading.settle_coin,
-            )
+    def from_app_config(cls, config: AppConfig) -> BybitClient:
+        mode = config.bybit.mode.lower()
+        testnet = mode == "testnet"
+        demo = mode == "demo"
+        return cls(
+            api_key=config.bybit.api_key,
+            api_secret=config.bybit.api_secret,
+            testnet=testnet,
+            demo=demo,
         )
-        accounts = result.get("list") or []
-        if not accounts:
+
+    def get_wallet_balance(self, coin: str = "USDT") -> float:
+        resp = self.session.get_wallet_balance(
+            accountType="UNIFIED",
+            coin=coin,
+        )
+        result = resp.get("result", {})
+        list_acc = result.get("list", [])
+        if not list_acc:
             return 0.0
-
-        for coin in accounts[0].get("coin") or []:
-            if coin.get("coin") == self.trading.settle_coin:
-                wallet = float(coin.get("walletBalance") or 0)
-                locked = float(coin.get("locked") or 0)
-                return max(wallet - locked, 0.0)
-
-        total = accounts[0].get("totalAvailableBalance")
-        if total is not None:
-            return float(total)
+        coins = list_acc[0].get("coin", [])
+        for c in coins:
+            if c.get("coin") == coin:
+                return float(c.get("equity", 0.0) or 0.0)
         return 0.0
 
-    def get_linear_tickers(self) -> list[SymbolTicker]:
-        result = self._unwrap(
-            self.session.get_tickers(category=self.trading.category)
+    def get_ticker_price(self, symbol: str) -> float:
+        resp = self.session.get_tickers(
+            category="linear",
+            symbol=symbol,
         )
-        tickers: list[SymbolTicker] = []
-        suffix = self.trading.settle_coin
+        list_t = resp.get("result", {}).get("list", [])
+        if list_t:
+            return float(list_t[0].get("lastPrice", 0.0))
+        return 0.0
 
-        for item in result.get("list") or []:
-            symbol = item.get("symbol", "")
-            if not symbol.endswith(suffix):
-                continue
-            change_raw = item.get("price24hPcnt")
-            last_price = item.get("lastPrice")
-            if change_raw is None or last_price is None:
-                continue
-            change_pct = float(change_raw) * 100.0
-            tickers.append(
-                SymbolTicker(
-                    symbol=symbol,
-                    change_pct_24h=change_pct,
-                    last_price=float(last_price),
-                )
-            )
-        return tickers
-
-    def get_klines(
-        self,
-        symbol: str,
-        limit: int,
-        start_ms: int | None = None,
-        end_ms: int | None = None,
-    ) -> list[list[str]]:
-        params: dict[str, Any] = {
-            "category": self.trading.category,
-            "symbol": symbol,
-            "interval": self.trading.candle_interval,
-            "limit": limit,
-        }
-        if start_ms is not None:
-            params["start"] = start_ms
-        if end_ms is not None:
-            params["end"] = end_ms
-        result = self._unwrap(self.session.get_kline(**params))
-        rows = result.get("list") or []
-        rows.reverse()
-        return rows
-
-    def get_instrument_info(self, symbol: str) -> dict[str, Any]:
-        result = self._unwrap(
-            self.session.get_instruments_info(
-                category=self.trading.category,
-                symbol=symbol,
-            )
+    def get_klines(self, symbol: str, interval: str = "60", limit: int = 600) -> List[Dict[str, Any]]:
+        resp = self.session.get_kline(
+            category="linear",
+            symbol=symbol,
+            interval=interval,
+            limit=limit,
         )
-        items = result.get("list") or []
-        if not items:
-            raise RuntimeError(f"No instrument info for {symbol}")
-        return items[0]
+        list_k = resp.get("result", {}).get("list", [])
+        list_k.reverse() # Chronological order
+        return list_k
 
-    def _format_qty(self, qty: float, step: float) -> str:
-        if step >= 1:
-            return str(int(qty))
-        precision = max(0, int(round(-math.log10(step))))
-        return f"{qty:.{precision}f}"
-
-    def _round_qty(
-        self,
-        qty: float,
-        symbol: str,
-        *,
-        cap_to_max: bool = True,
-        market_order: bool = False,
-    ) -> str:
-        info = self.get_instrument_info(symbol)
-        lot = info.get("lotSizeFilter") or {}
-        step = float(lot.get("qtyStep") or "0.001")
-        min_qty = float(lot.get("minOrderQty") or step)
-        if market_order:
-            max_qty = float(lot.get("maxMktOrderQty") or lot.get("maxOrderQty") or 0)
-        else:
-            max_qty = float(lot.get("maxOrderQty") or lot.get("maxMktOrderQty") or 0)
-
-        if step <= 0:
-            step = 0.001
-
-        rounded = math.floor(qty / step) * step
-        if cap_to_max and max_qty > 0:
-            rounded = min(rounded, max_qty)
-            rounded = math.floor(rounded / step) * step
-
-        if rounded < min_qty:
-            return ""
-        return self._format_qty(rounded, step)
-
-    def _qty_from_position(self, size_str: str, symbol: str) -> str:
-        info = self.get_instrument_info(symbol)
-        lot = info.get("lotSizeFilter") or {}
-        step = float(lot.get("qtyStep") or "0.001")
-        min_qty = float(lot.get("minOrderQty") or step)
-
-        if step <= 0:
-            step = 0.001
-
-        qty = float(size_str)
-        rounded = math.floor(qty / step) * step
-        if rounded < min_qty:
-            return ""
-        return self._format_qty(rounded, step)
-
-    def get_max_leverage(self, symbol: str) -> float:
-        """Max leverage for symbol (risk-limit lowest tier, then instrument filter)."""
+    def set_leverage(self, symbol: str, leverage: int) -> bool:
         try:
-            result = self._unwrap(
-                self.session.get_risk_limit(
-                    category=self.trading.category,
-                    symbol=symbol,
-                )
-            )
-            best: float | None = None
-            for item in result.get("list") or []:
-                item_symbol = item.get("symbol") or symbol
-                if item_symbol != symbol:
-                    continue
-                max_lev = float(item.get("maxLeverage") or 0)
-                if max_lev <= 0:
-                    continue
-                if int(item.get("isLowestRisk") or 0) == 1:
-                    return max_lev
-                if best is None or max_lev > best:
-                    best = max_lev
-            if best is not None:
-                return best
-        except Exception:
-            logger.debug("Could not read risk-limit for %s", symbol, exc_info=True)
-
-        info = self.get_instrument_info(symbol)
-        lev_filter = info.get("leverageFilter") or {}
-        return float(lev_filter.get("maxLeverage") or 1)
-
-    def resolve_common_leverage(self, symbols: list[str], desired: int) -> int:
-        """
-        Uniform leverage for a batch of symbols:
-        min(config desired, min(max leverage among symbols)).
-        """
-        desired = max(1, int(desired))
-        if not symbols:
-            return desired
-
-        caps: list[tuple[str, int]] = []
-        for symbol in symbols:
-            try:
-                max_lev = int(math.floor(self.get_max_leverage(symbol)))
-            except Exception:
-                logger.warning(
-                    "Could not get max leverage for %s; treating as x1",
-                    symbol,
-                    exc_info=True,
-                )
-                max_lev = 1
-            caps.append((symbol, max(1, max_lev)))
-
-        limiting_symbol, group_max = min(caps, key=lambda item: item[1])
-        common = min(desired, group_max)
-        caps_text = ", ".join(f"{sym}=x{lev}" for sym, lev in caps)
-        if common < desired:
-            logger.info(
-                "Common leverage x%s (config x%s), limited by %s (max x%s). "
-                "Per-symbol max: %s",
-                common,
-                desired,
-                limiting_symbol,
-                group_max,
-                caps_text,
-            )
-        else:
-            logger.info(
-                "Common leverage x%s for %s symbols (all support >= config). "
-                "Per-symbol max: %s",
-                common,
-                len(symbols),
-                caps_text,
-            )
-        return common
-
-    def _set_leverage_raw(self, symbol: str, leverage: int) -> None:
-        self._unwrap(
             self.session.set_leverage(
-                category=self.trading.category,
+                category="linear",
                 symbol=symbol,
                 buyLeverage=str(leverage),
                 sellLeverage=str(leverage),
             )
-        )
-
-    def set_leverage(self, symbol: str, leverage: int) -> int:
-        """Set exact leverage for symbol. Returns leverage used (unchanged on 110043)."""
-        desired = max(1, int(leverage))
-        try:
-            self._set_leverage_raw(symbol, desired)
-            return desired
-        except (RuntimeError, InvalidRequestError) as exc:
-            msg = str(exc).lower()
-            if "leverage not modified" in msg or "110043" in msg:
-                logger.debug("Leverage already set for %s: %sx", symbol, desired)
-                return desired
+            return True
+        except Exception as e:
+            if "110043" in str(e): # Already set
+                return True
             raise
 
-    def place_market_order(
+    def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
+        resp = self.session.get_positions(
+            category="linear",
+            symbol=symbol,
+        )
+        list_p = resp.get("result", {}).get("list", [])
+        for p in list_p:
+            if float(p.get("size", 0.0) or 0.0) > 0:
+                return p
+        return None
+
+    def get_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        resp = self.session.get_open_orders(
+            category="linear",
+            symbol=symbol,
+        )
+        return resp.get("result", {}).get("list", [])
+
+    def place_order(
         self,
         symbol: str,
         side: str,
+        order_type: str,
         qty: str,
+        price: Optional[str] = None,
+        stop_loss: Optional[str] = None,
         reduce_only: bool = False,
-    ) -> dict[str, Any]:
-        params: dict[str, Any] = {
-            "category": self.trading.category,
+    ) -> Optional[Dict[str, Any]]:
+        kwargs: Dict[str, Any] = {
+            "category": "linear",
             "symbol": symbol,
             "side": side,
-            "orderType": "Market",
-            "qty": qty,
+            "orderType": order_type,
+            "qty": str(qty),
+            "reduceOnly": reduce_only,
         }
-        if reduce_only:
-            params["reduceOnly"] = True
-        return self._unwrap(self.session.place_order(**params))
+        if order_type == "Limit" and price:
+            kwargs["price"] = str(price)
+        if stop_loss:
+            kwargs["stopLoss"] = str(stop_loss)
 
-    def open_market_position(
-        self, symbol: str, side: str, usdt_amount: float, leverage: int
-    ) -> ExecutedOrder:
-        effective_leverage = 0
-        try:
-            effective_leverage = self.set_leverage(symbol, leverage)
-            ticker = next(
-                (t for t in self.get_linear_tickers() if t.symbol == symbol),
-                None,
-            )
-            if ticker is None or ticker.last_price <= 0:
-                return ExecutedOrder(
-                    symbol=symbol,
-                    side=side,
-                    qty="0",
-                    usdt_amount=usdt_amount,
-                    order_id=None,
-                    success=False,
-                    error="Could not get last price",
-                    leverage=effective_leverage,
-                )
+        resp = self.session.place_order(**kwargs)
+        return resp.get("result")
 
-            notional = usdt_amount * effective_leverage
-            qty = self._round_qty(
-                notional / ticker.last_price, symbol, market_order=True
-            )
-            if not qty:
-                return ExecutedOrder(
-                    symbol=symbol,
-                    side=side,
-                    qty="0",
-                    usdt_amount=usdt_amount,
-                    order_id=None,
-                    success=False,
-                    error="Calculated qty below minimum",
-                    leverage=effective_leverage,
-                )
+    def cancel_order(self, symbol: str, order_id: str) -> bool:
+        self.session.cancel_order(
+            category="linear",
+            symbol=symbol,
+            orderId=order_id,
+        )
+        return True
 
-            result = self.place_market_order(symbol, side, qty)
-            order_id = (result.get("orderId") or None)
-            logger.info(
-                "Opened %s %s qty=%s margin=%.4f leverage=x%s",
-                symbol,
-                side,
-                qty,
-                usdt_amount,
-                effective_leverage,
-            )
-            return ExecutedOrder(
-                symbol=symbol,
-                side=side,
-                qty=qty,
-                usdt_amount=usdt_amount,
-                order_id=order_id,
-                success=True,
-                leverage=effective_leverage,
-            )
-        except Exception as exc:
-            logger.exception("Failed to open position for %s", symbol)
-            return ExecutedOrder(
-                symbol=symbol,
-                side=side,
-                qty="0",
-                usdt_amount=usdt_amount,
-                order_id=None,
-                success=False,
-                error=str(exc),
-                leverage=effective_leverage,
-            )
+    def cancel_all_orders(self, symbol: str) -> bool:
+        self.session.cancel_all_orders(
+            category="linear",
+            symbol=symbol,
+        )
+        return True
 
-    def get_open_positions(self) -> list[PositionInfo]:
-        positions: list[PositionInfo] = []
-        cursor: str | None = None
+    def amend_order_trading_stop(
+        self,
+        symbol: str,
+        stop_loss: Optional[str] = None,
+        trailing_stop: Optional[str] = None,
+        active_price: Optional[str] = None,
+    ) -> bool:
+        kwargs: Dict[str, Any] = {
+            "category": "linear",
+            "symbol": symbol,
+        }
+        if stop_loss is not None:
+            kwargs["stopLoss"] = str(stop_loss)
+        if trailing_stop is not None:
+            kwargs["trailingStop"] = str(trailing_stop)
+        if active_price is not None:
+            kwargs["activePrice"] = str(active_price)
 
-        while True:
-            params: dict[str, Any] = {
-                "category": self.trading.category,
-                "settleCoin": self.trading.settle_coin,
-                "limit": 200,
-            }
-            if cursor:
-                params["cursor"] = cursor
-
-            result = self._unwrap(self.session.get_positions(**params))
-
-            for item in result.get("list") or []:
-                size = float(item.get("size") or 0)
-                if size == 0:
-                    continue
-                entry_price = float(item.get("avgPrice") or 0)
-                position_value = float(item.get("positionValue") or 0)
-                if position_value <= 0:
-                    position_value = size * entry_price
-                positions.append(
-                    PositionInfo(
-                        symbol=item.get("symbol", ""),
-                        side=item.get("side", ""),
-                        size=size,
-                        size_str=str(item.get("size") or "0"),
-                        entry_price=entry_price,
-                        mark_price=float(item.get("markPrice") or 0),
-                        unrealised_pnl=float(item.get("unrealisedPnl") or 0),
-                        leverage=str(item.get("leverage") or "1"),
-                        position_value=position_value,
-                    )
-                )
-
-            cursor = result.get("nextPageCursor") or None
-            if not cursor:
-                break
-
-        return positions
-
-    def _close_position(self, pos: PositionInfo) -> ClosedPosition:
-        close_side = "Sell" if pos.side == "Buy" else "Buy"
-        qty = self._qty_from_position(pos.size_str, pos.symbol)
-        if not qty:
-            logger.warning(
-                "Skip close %s: qty %s below minimum",
-                pos.symbol,
-                pos.size_str,
-            )
-            return ClosedPosition(
-                symbol=pos.symbol,
-                side=pos.side,
-                pnl=pos.unrealised_pnl,
-                position_value=pos.position_value,
-                success=False,
-                error="qty below minimum",
-            )
-        try:
-            self.place_market_order(pos.symbol, close_side, qty, reduce_only=True)
-            logger.info(
-                "Closed position: %s (%s) PnL=%.4f",
-                pos.symbol,
-                pos.side,
-                pos.unrealised_pnl,
-            )
-            return ClosedPosition(
-                symbol=pos.symbol,
-                side=pos.side,
-                pnl=pos.unrealised_pnl,
-                position_value=pos.position_value,
-                success=True,
-            )
-        except Exception as exc:
-            logger.error("Failed to close %s: %s", pos.symbol, exc)
-            return ClosedPosition(
-                symbol=pos.symbol,
-                side=pos.side,
-                pnl=pos.unrealised_pnl,
-                position_value=pos.position_value,
-                success=False,
-                error=str(exc),
-            )
-
-    def close_all_positions(self) -> list[ClosedPosition]:
-        closed: list[ClosedPosition] = []
-        max_attempts = 3
-
-        for attempt in range(1, max_attempts + 1):
-            positions = self.get_open_positions()
-            if not positions:
-                break
-
-            if attempt > 1:
-                logger.warning(
-                    "Retry closing positions (attempt %s/%s, open=%s)",
-                    attempt,
-                    max_attempts,
-                    len(positions),
-                )
-
-            for pos in positions:
-                result = self._close_position(pos)
-                closed.append(result)
-
-            if not self.get_open_positions():
-                break
-
-        remaining = self.get_open_positions()
-        if remaining:
-            logger.error(
-                "Could not close all positions: %s still open (%s)",
-                len(remaining),
-                ", ".join(p.symbol for p in remaining),
-            )
-
-        return closed
-
-    @classmethod
-    def from_app_config(cls, config: AppConfig) -> "BybitClient":
-        return cls(config.bybit, config.trading)
+        self.session.set_trading_stop(**kwargs)
+        return True

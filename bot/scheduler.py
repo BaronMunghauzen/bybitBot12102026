@@ -2,157 +2,69 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
-
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
-
 from bot.config import AppConfig
 from bot.telegram_bot import TelegramService
 from bot.trader import Trader
 
 logger = logging.getLogger(__name__)
 
-
 class DailyScheduler:
-    def __init__(
-        self,
-        config: AppConfig,
-        trader: Trader,
-        telegram: TelegramService,
-    ) -> None:
+    def __init__(self, config: AppConfig, trader: Trader, telegram: TelegramService) -> None:
         self.config = config
         self.trader = trader
         self.telegram = telegram
-        self.scheduler = AsyncIOScheduler(timezone=timezone.utc)
-
-    def _run_time(self) -> tuple[int, int, int]:
-        sched = self.config.scheduler
-        delay = self.config.trading.delay_after_candle_seconds
-        base = datetime(
-            2000,
-            1,
-            1,
-            sched.candle_close_hour_utc,
-            sched.candle_close_minute_utc,
-            0,
-            tzinfo=timezone.utc,
-        )
-        run_at = base + timedelta(seconds=delay)
-        return run_at.hour, run_at.minute, run_at.second
-
-    async def run_trading_cycle(self):
-        logger.info("Daily trading cycle started")
-        try:
-            closed, balance = await asyncio.to_thread(
-                self.trader.close_positions_and_get_balance
-            )
-            await self.telegram.notify_balance(balance, closed)
-
-            result = await asyncio.to_thread(
-                self.trader.scan_and_execute, balance, closed
-            )
-            await self.telegram.notify_cycle_result(result)
-            logger.info("Daily trading cycle finished")
-            return result, closed
-        except Exception:
-            logger.exception("Daily trading cycle failed")
-            await self.telegram.send_message(
-                "❌ Ошибка при выполнении торгового цикла. Смотрите логи сервера."
-            )
-            raise
-
-    async def run_take_profit_check(self) -> None:
-        cfg = self.config.trading
-        if not cfg.take_profit_enabled:
-            return
-
-        try:
-            result = await asyncio.to_thread(self.trader.run_take_profit_check)
-            if not result.triggered:
-                return
-
-            await self.telegram.notify_take_profit(result)
-            logger.info(
-                "Take profit check closed %s position record(s)",
-                len(result.closed_positions),
-            )
-        except Exception:
-            logger.exception("Take profit check failed")
-            await self.telegram.send_message(
-                "❌ Ошибка проверки take profit. Смотрите логи сервера."
-            )
+        self.scheduler = AsyncIOScheduler()
 
     def start(self) -> None:
-        sched = self.config.scheduler
-        delay = self.config.trading.delay_after_candle_seconds
-        hour, minute, second = self._run_time()
+        t_conf = self.config.trading
+        
+        # 1. Часовой алгоритм (пункты 4-5)
         self.scheduler.add_job(
-            self.run_trading_cycle,
-            CronTrigger(
-                hour=hour,
-                minute=minute,
-                second=second,
-                timezone=timezone.utc,
-            ),
-            id="daily_trading_cycle",
+            self._job_hourly,
+            "cron",
+            minute=t_conf.schedule_minute,
+            second=t_conf.schedule_second,
+            id="hourly_trading_job",
             replace_existing=True,
-            misfire_grace_time=300,
         )
 
-        tp_cfg = self.config.trading
-        if tp_cfg.take_profit_enabled:
-            self.scheduler.add_job(
-                self.run_take_profit_check,
-                IntervalTrigger(
-                    minutes=tp_cfg.take_profit_check_interval_minutes,
-                    timezone=timezone.utc,
-                ),
-                id="take_profit_monitor",
-                replace_existing=True,
-                misfire_grace_time=60,
-            )
+        # 2. Минутный мониторинг (пункт 6 и далее)
+        self.scheduler.add_job(
+            self._job_minute,
+            "cron",
+            second=0,
+            id="minute_monitoring_job",
+            replace_existing=True,
+        )
 
         self.scheduler.start()
-        close_utc = (
-            f"{sched.candle_close_hour_utc:02d}:"
-            f"{sched.candle_close_minute_utc:02d} UTC"
-        )
-        run_utc = f"{hour:02d}:{minute:02d}:{second:02d} UTC"
-        # MSK = UTC+3 year-round (no DST)
-        msk_offset = timedelta(hours=3)
-        close_msk = (
-            datetime(2000, 1, 1, sched.candle_close_hour_utc, sched.candle_close_minute_utc)
-            + msk_offset
-        ).strftime("%H:%M")
-        run_msk = (
-            datetime(2000, 1, 1, hour, minute, second) + msk_offset
-        ).strftime("%H:%M:%S")
         logger.info(
-            "Scheduler started: Bybit 1D candle closes at %s (%s MSK), "
-            "bot runs %s (%s MSK), delay=%ss",
-            close_utc,
-            close_msk,
-            run_utc,
-            run_msk,
-            delay,
+            f"Scheduler started. Hourly job set at :59:30. Minute job set every minute."
         )
-        if tp_cfg.take_profit_enabled:
-            logger.info(
-                "Take profit monitor: every %s min, target sum(uPnL)/sum(margin) "
-                ">= take_profit_pct × avg_leverage "
-                "(config: %.2f%% notional ≈ %.2f%% margin ROI at x%s; "
-                "avg leverage uses actual per-symbol leverages)",
-                tp_cfg.take_profit_check_interval_minutes,
-                tp_cfg.take_profit_pct,
-                tp_cfg.take_profit_pct * tp_cfg.leverage,
-                tp_cfg.leverage,
-            )
+
+    async def _job_hourly(self) -> None:
+        logger.info("Running hourly trading check...")
+        try:
+            messages = await asyncio.to_thread(self.trader.run_hourly_check)
+            for msg in messages:
+                await self.telegram.send_message(msg)
+        except Exception as e:
+            err_msg = f"❌ **Ошибка в часовом алгоритме:**\n`{type(e).__name__}: {e}`"
+            logger.exception("Error in hourly job")
+            await self.telegram.send_message(err_msg)
+
+    async def _job_minute(self) -> None:
+        logger.info("Running minute monitoring check...")
+        try:
+            messages = await asyncio.to_thread(self.trader.run_minute_check)
+            for msg in messages:
+                await self.telegram.send_message(msg)
+        except Exception as e:
+            err_msg = f"❌ **Ошибка в минутном мониторинге:**\n`{type(e).__name__}: {e}`"
+            logger.exception("Error in minute job")
+            await self.telegram.send_message(err_msg)
 
     def shutdown(self) -> None:
-        if self.scheduler.running:
-            self.scheduler.shutdown(wait=False)
-
-    async def run_once_now(self):
-        return await self.run_trading_cycle()
+        self.scheduler.shutdown()
+        logger.info("Scheduler shutdown.")

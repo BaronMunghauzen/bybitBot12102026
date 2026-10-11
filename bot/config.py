@@ -1,169 +1,104 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
-from urllib.parse import quote
-
+from typing import List, Optional
 import yaml
 
-logger = logging.getLogger(__name__)
-
 DEFAULT_CONFIG_PATH = Path("config.yaml")
-
 
 @dataclass
 class BybitConfig:
     api_key: str
     api_secret: str
-    mode: str  # demo | mainnet | testnet
-    recv_window: int
-
+    mode: str = "demo"
 
 @dataclass
 class TradingConfig:
-    category: str
-    settle_coin: str
-    candle_interval: str
-    delay_after_candle_seconds: int
-    ma_fast: int
-    ma_slow: int
-    min_candles_for_ma: int
-    long_min_change_pct: float
-    short_max_change_pct: float
-    leverage: int
-    account_type: str
-    signal_avg_candles: int
-    take_profit_enabled: bool
-    take_profit_pct: float
-    take_profit_check_interval_minutes: int
-
+    category: str = "linear"
+    settle_coin: str = "USDT"
+    risk_per_trade_pct: Optional[float] = None
+    leverage: int = 50
+    symbols: List[str] = field(default_factory=lambda: ["DOGEUSDT"])
+    initial_size_mult: float = 5.0
+    ma_fast: int = 100
+    ma_slow: int = 500
+    max_add_orders: int = 5
+    initial_stop_loss_pct: float = 1.5
+    trailing_stop_pct: float = 1.0
+    schedule_minute: int = 59
+    schedule_second: int = 30
 
 @dataclass
 class TelegramConfig:
     bot_token: str
     allowed_user_id: int
-    pnl_trigger: str
-    hypothetical_trigger: str
-    take_profit_trigger: str
-    proxy_host: str
-    proxy_port: int
-    proxy_username: str
-    proxy_password: str
-
-    def proxy_url(self) -> str | None:
-        host = self.proxy_host.strip()
-        if not host or self.proxy_port <= 0:
-            return None
-        if self.proxy_username.strip():
-            user = quote(self.proxy_username.strip(), safe="")
-            password = quote(self.proxy_password, safe="")
-            return f"http://{user}:{password}@{host}:{self.proxy_port}"
-        return f"http://{host}:{self.proxy_port}"
-
-
-@dataclass
-class SchedulerConfig:
-    candle_close_hour_utc: int
-    candle_close_minute_utc: int
-
+    proxy_host: str = ""
+    proxy_port: int = 0
+    proxy_username: str = ""
+    proxy_password: str = ""
 
 @dataclass
 class LoggingConfig:
-    level: str
-
+    level: str = "INFO"
 
 @dataclass
 class AppConfig:
     bybit: BybitConfig
     trading: TradingConfig
     telegram: TelegramConfig
-    scheduler: SchedulerConfig
     logging: LoggingConfig
 
-
-def _require(section: dict[str, Any], key: str) -> Any:
-    if key not in section:
-        raise ValueError(f"Missing required config key: {key}")
-    return section[key]
-
-
-def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
-    config_path = Path(path)
-    if not config_path.exists():
-        raise FileNotFoundError(
-            f"Config file not found: {config_path}. "
-            f"Copy config.yaml.example to config.yaml and fill in values."
-        )
-
-    with config_path.open(encoding="utf-8") as fh:
-        raw = yaml.safe_load(fh) or {}
+def load_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
 
     bybit_raw = raw.get("bybit", {})
     trading_raw = raw.get("trading", {})
     telegram_raw = raw.get("telegram", {})
-    scheduler_raw = raw.get("scheduler", {})
     logging_raw = raw.get("logging", {})
-
-    mode = str(_require(bybit_raw, "mode")).lower()
-    if mode not in {"demo", "mainnet", "testnet"}:
-        raise ValueError("bybit.mode must be one of: demo, mainnet, testnet")
 
     return AppConfig(
         bybit=BybitConfig(
-            api_key=str(_require(bybit_raw, "api_key")),
-            api_secret=str(_require(bybit_raw, "api_secret")),
-            mode=mode,
-            recv_window=int(bybit_raw.get("recv_window", 60000)),
+            api_key=bybit_raw.get("api_key", ""),
+            api_secret=bybit_raw.get("api_secret", ""),
+            mode=bybit_raw.get("mode", "demo"),
         ),
         trading=TradingConfig(
-            category=str(trading_raw.get("category", "linear")),
-            settle_coin=str(trading_raw.get("settle_coin", "USDT")),
-            candle_interval=str(trading_raw.get("candle_interval", "D")),
-            delay_after_candle_seconds=int(
-                trading_raw.get("delay_after_candle_seconds", 30)
-            ),
-            ma_fast=int(trading_raw.get("ma_fast", 50)),
-            ma_slow=int(trading_raw.get("ma_slow", 200)),
-            min_candles_for_ma=int(trading_raw.get("min_candles_for_ma", 200)),
-            long_min_change_pct=float(trading_raw.get("long_min_change_pct", 4.0)),
-            short_max_change_pct=float(trading_raw.get("short_max_change_pct", -4.0)),
-            leverage=int(trading_raw.get("leverage", 1)),
-            account_type=str(trading_raw.get("account_type", "UNIFIED")),
-            signal_avg_candles=int(trading_raw.get("signal_avg_candles", 10)),
-            take_profit_enabled=bool(trading_raw.get("take_profit_enabled", True)),
-            take_profit_pct=float(trading_raw.get("take_profit_pct", 2.0)),
-            take_profit_check_interval_minutes=int(
-                trading_raw.get("take_profit_check_interval_minutes", 5)
-            ),
+            category=trading_raw.get("category", "linear"),
+            settle_coin=trading_raw.get("settle_coin", "USDT"),
+            risk_per_trade_pct=trading_raw.get("risk_per_trade_pct"),
+            leverage=int(trading_raw.get("leverage", 50)),
+            symbols=trading_raw.get("symbols", ["DOGEUSDT"]),
+            initial_size_mult=float(trading_raw.get("initial_size_mult", 5.0)),
+            ma_fast=int(trading_raw.get("ma_fast", 100)),
+            ma_slow=int(trading_raw.get("ma_slow", 500)),
+            max_add_orders=int(trading_raw.get("max_add_orders", 5)),
+            initial_stop_loss_pct=float(trading_raw.get("initial_stop_loss_pct", 1.5)),
+            trailing_stop_pct=float(trading_raw.get("trailing_stop_pct", 1.0)),
+            schedule_minute=int(trading_raw.get("schedule_minute", 59)),
+            schedule_second=int(trading_raw.get("schedule_second", 30)),
         ),
         telegram=TelegramConfig(
-            bot_token=str(_require(telegram_raw, "bot_token")),
-            allowed_user_id=int(_require(telegram_raw, "allowed_user_id")),
-            pnl_trigger=str(telegram_raw.get("pnl_trigger", "/pnl")),
-            hypothetical_trigger=str(
-                telegram_raw.get("hypothetical_trigger", "/whatif")
-            ),
-            take_profit_trigger=str(
-                telegram_raw.get("take_profit_trigger", "/tpcheck")
-            ),
-            proxy_host=str(telegram_raw.get("proxy_host", "")),
+            bot_token=telegram_raw.get("bot_token", ""),
+            allowed_user_id=int(telegram_raw.get("allowed_user_id", 0)),
+            proxy_host=telegram_raw.get("proxy_host", ""),
             proxy_port=int(telegram_raw.get("proxy_port", 0)),
-            proxy_username=str(telegram_raw.get("proxy_username", "")),
-            proxy_password=str(telegram_raw.get("proxy_password", "")),
+            proxy_username=telegram_raw.get("proxy_username", ""),
+            proxy_password=telegram_raw.get("proxy_password", ""),
         ),
-        scheduler=SchedulerConfig(
-            candle_close_hour_utc=int(scheduler_raw.get("candle_close_hour_utc", 0)),
-            candle_close_minute_utc=int(scheduler_raw.get("candle_close_minute_utc", 0)),
+        logging=LoggingConfig(
+            level=logging_raw.get("level", "INFO"),
         ),
-        logging=LoggingConfig(level=str(logging_raw.get("level", "INFO"))),
     )
 
-
-def setup_logging(level: str) -> None:
+def setup_logging(level_name: str) -> None:
+    level = getattr(logging, level_name.upper(), logging.INFO)
     logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
+        level=level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )

@@ -1,258 +1,72 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from datetime import date, datetime, timezone
-
-from bot.bybit_client import BybitClient, SymbolTicker
-from bot.config import TradingConfig
-from bot.indicators import (
-    Candle,
-    daily_change_pct,
-    is_negative,
-    is_positive,
-    parse_klines,
-    sma,
-)
+from typing import List, Optional, Tuple
+from bot.indicators import calculate_sma
 
 logger = logging.getLogger(__name__)
 
+class Strategy:
+    def __init__(self, config) -> None:
+        self.config = config.trading
 
-@dataclass
-class Signal:
-    symbol: str
-    side: str  # Buy (long) or Sell (short)
-    change_pct_24h: float
-    ma_fast: float
-    ma_slow: float
+    def calculate_mas(self, closes: List[float], current_price: float) -> Tuple[float, float, float, float]:
+        fast_period = self.config.ma_fast
+        slow_period = self.config.ma_slow
 
+        if len(closes) < slow_period:
+            raise ValueError(f"Not enough klines: need at least {slow_period}, got {len(closes)}")
 
-class StrategyEngine:
-    def __init__(self, client: BybitClient, trading_cfg: TradingConfig) -> None:
-        self.client = client
-        self.cfg = trading_cfg
+        closes_curr = closes[:-1] + [current_price]
+        fast_curr = calculate_sma(closes_curr, fast_period)
+        slow_curr = calculate_sma(closes_curr, slow_period)
 
-    def _min_closed_candles(self) -> int:
-        return max(self.cfg.min_candles_for_ma, self.cfg.ma_slow)
+        fast_prev = calculate_sma(closes, fast_period)
+        slow_prev = calculate_sma(closes, slow_period)
 
-    def _kline_limit(self) -> int:
-        return self._min_closed_candles() + 5
+        return fast_curr, slow_curr, fast_prev, slow_prev
 
-    def _load_closed_candles(self, symbol: str) -> list[Candle] | None:
-        raw = self.client.get_klines(symbol, limit=self._kline_limit())
-        candles = parse_klines(raw)
+    def check_signal(self, fast_curr: float, slow_curr: float, fast_prev: float, slow_prev: float) -> Optional[str]:
+        if fast_prev <= slow_prev and fast_curr > slow_curr:
+            return "Buy"
+        elif fast_prev >= slow_prev and fast_curr < slow_curr:
+            return "Sell"
+        return None
 
-        if len(candles) < 2:
+    def calculate_initial_stop_loss(
+        self, side: str, entry_price: float, short_ma: float
+    ) -> float:
+        pct = self.config.initial_stop_loss_pct / 100.0
+        if side == "Buy":
+            sl_pct_price = entry_price * (1.0 - pct)
+            sl_ma_price = short_ma * (1.0 - 0.001)
+            return max(sl_pct_price, sl_ma_price)
+        else:
+            sl_pct_price = entry_price * (1.0 + pct)
+            sl_ma_price = short_ma * (1.0 + 0.001)
+            return min(sl_pct_price, sl_ma_price)
+
+    def calculate_add_orders_prices(
+        self, side: str, entry_price: float, initial_sl: float, max_adds: int
+    ) -> List[float]:
+        sl_distance = abs(entry_price - initial_sl)
+        prices = []
+        for i in range(1, max_adds + 1):
+            mult = 1 + i # 1st add: 2*sl, 2nd: 3*sl, etc.
+            if side == "Buy":
+                p = entry_price + (mult * sl_distance)
+            else:
+                p = entry_price - (mult * sl_distance)
+            prices.append(round(p, 4))
+        return prices
+
+    def calculate_updated_stop_loss(
+        self, side: str, avg_entry_price: float, filled_adds_count: int
+    ) -> Optional[float]:
+        if filled_adds_count <= 0:
             return None
-
-        # Drop the currently forming daily candle; use only closed bars.
-        if len(candles) > 1:
-            candles = candles[:-1]
-
-        if len(candles) < self._min_closed_candles():
-            logger.debug(
-                "%s: not enough candles (%s < %s)",
-                symbol,
-                len(candles),
-                self._min_closed_candles(),
-            )
-            return None
-
-        return candles
-
-    def _load_closed_candles_before(
-        self, symbol: str, before_day: date
-    ) -> list[Candle] | None:
-        end_ms = int(
-            datetime(
-                before_day.year,
-                before_day.month,
-                before_day.day,
-                tzinfo=timezone.utc,
-            ).timestamp()
-            * 1000
-        ) - 1
-        raw = self.client.get_klines(
-            symbol, limit=self._kline_limit(), end_ms=end_ms
-        )
-        candles = parse_klines(raw)
-
-        if len(candles) < self._min_closed_candles():
-            logger.debug(
-                "%s: not enough historical candles before %s (%s < %s)",
-                symbol,
-                before_day.isoformat(),
-                len(candles),
-                self._min_closed_candles(),
-            )
-            return None
-
-        return candles
-
-    def _evaluate_long_on_candles(
-        self,
-        symbol: str,
-        change_pct: float,
-        candles: list[Candle],
-    ) -> Signal | None:
-        closes = [c.close for c in candles]
-        ma_fast = sma(closes, self.cfg.ma_fast)
-        ma_slow = sma(closes, self.cfg.ma_slow)
-        if ma_fast is None or ma_slow is None:
-            return None
-
-        if ma_fast <= ma_slow:
-            return None
-
-        last = candles[-1]
-        prev = candles[-2]
-        if not is_positive(last) or not is_negative(prev):
-            return None
-
-        if not (last.close > ma_fast and last.open < ma_fast):
-            return None
-
-        logger.info(
-            "Short signal (step 4): %s change=%.2f%% MA%d=%.6f MA%d=%.6f "
-            "open=%.6f close=%.6f",
-            symbol,
-            change_pct,
-            self.cfg.ma_fast,
-            ma_fast,
-            self.cfg.ma_slow,
-            ma_slow,
-            last.open,
-            last.close,
-        )
-        return Signal(
-            symbol=symbol,
-            side="Sell",
-            change_pct_24h=change_pct,
-            ma_fast=ma_fast,
-            ma_slow=ma_slow,
-        )
-
-    def evaluate_long_at_entry(self, symbol: str, entry_date: date) -> Signal | None:
-        candles = self._load_closed_candles_before(symbol, entry_date)
-        if candles is None or len(candles) < 2:
-            return None
-
-        change_pct = daily_change_pct(candles[-1])
-        if change_pct <= self.cfg.long_min_change_pct:
-            return None
-
-        return self._evaluate_long_on_candles(symbol, change_pct, candles)
-
-    def _evaluate_short_on_candles(
-        self,
-        symbol: str,
-        change_pct: float,
-        candles: list[Candle],
-    ) -> Signal | None:
-        closes = [c.close for c in candles]
-        ma_fast = sma(closes, self.cfg.ma_fast)
-        ma_slow = sma(closes, self.cfg.ma_slow)
-        if ma_fast is None or ma_slow is None:
-            return None
-
-        if ma_fast >= ma_slow:
-            return None
-
-        last = candles[-1]
-        prev = candles[-2]
-        if not is_negative(last) or not is_positive(prev):
-            return None
-
-        if not (last.close < ma_fast and last.open > ma_fast):
-            return None
-
-        logger.info(
-            "Long signal (step 6): %s change=%.2f%% MA%d=%.6f MA%d=%.6f "
-            "open=%.6f close=%.6f",
-            symbol,
-            change_pct,
-            self.cfg.ma_fast,
-            ma_fast,
-            self.cfg.ma_slow,
-            ma_slow,
-            last.open,
-            last.close,
-        )
-        return Signal(
-            symbol=symbol,
-            side="Buy",
-            change_pct_24h=change_pct,
-            ma_fast=ma_fast,
-            ma_slow=ma_slow,
-        )
-
-    def evaluate_short_at_entry(self, symbol: str, entry_date: date) -> Signal | None:
-        candles = self._load_closed_candles_before(symbol, entry_date)
-        if candles is None or len(candles) < 2:
-            return None
-
-        change_pct = daily_change_pct(candles[-1])
-        if change_pct >= self.cfg.short_max_change_pct:
-            return None
-
-        return self._evaluate_short_on_candles(symbol, change_pct, candles)
-
-    def _evaluate_short(
-        self, symbol: str, change_pct: float, _current_price: float
-    ) -> Signal | None:
-        candles = self._load_closed_candles(symbol)
-        if candles is None:
-            return None
-        return self._evaluate_short_on_candles(symbol, change_pct, candles)
-
-    def scan_long_candidates(self, tickers: list[SymbolTicker]) -> list[Signal]:
-        filtered = [
-            t
-            for t in tickers
-            if t.change_pct_24h > self.cfg.long_min_change_pct
-        ]
-        filtered.sort(key=lambda t: t.change_pct_24h, reverse=True)
-
-        signals: list[Signal] = []
-        for ticker in filtered:
-            signal = self._evaluate_long(
-                ticker.symbol,
-                ticker.change_pct_24h,
-                ticker.last_price,
-            )
-            if signal:
-                signals.append(signal)
-        return signals
-
-    def _evaluate_long(
-        self, symbol: str, change_pct: float, _current_price: float
-    ) -> Signal | None:
-        candles = self._load_closed_candles(symbol)
-        if candles is None:
-            return None
-        return self._evaluate_long_on_candles(symbol, change_pct, candles)
-
-    def scan_short_candidates(self, tickers: list[SymbolTicker]) -> list[Signal]:
-        filtered = [
-            t
-            for t in tickers
-            if t.change_pct_24h < self.cfg.short_max_change_pct
-        ]
-        filtered.sort(key=lambda t: t.change_pct_24h)
-
-        signals: list[Signal] = []
-        for ticker in filtered:
-            signal = self._evaluate_short(
-                ticker.symbol,
-                ticker.change_pct_24h,
-                ticker.last_price,
-            )
-            if signal:
-                signals.append(signal)
-        return signals
-
-    @staticmethod
-    def format_last_candle_change(candles: list[Candle]) -> float:
-        if not candles:
-            return 0.0
-        return daily_change_pct(candles[-1])
+        pct = (filled_adds_count * 0.3) / 100.0
+        if side == "Buy":
+            return avg_entry_price * (1.0 + pct)
+        else:
+            return avg_entry_price * (1.0 - pct)

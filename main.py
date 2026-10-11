@@ -15,7 +15,6 @@ from bot.trader import Trader
 
 logger = logging.getLogger(__name__)
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Bybit futures trading bot")
     parser.add_argument(
@@ -24,13 +23,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_CONFIG_PATH,
         help="Path to config.yaml",
     )
-    parser.add_argument(
-        "--run-once",
-        action="store_true",
-        help="Run trading cycle immediately (for testing) and exit",
-    )
     return parser.parse_args()
-
 
 def _configure_stdout() -> None:
     if hasattr(sys.stdout, "reconfigure"):
@@ -38,7 +31,6 @@ def _configure_stdout() -> None:
             sys.stdout.reconfigure(encoding="utf-8")
         except Exception:
             pass
-
 
 async def main_async() -> None:
     args = parse_args()
@@ -50,28 +42,29 @@ async def main_async() -> None:
     telegram = TelegramService(config, client, trader)
     scheduler = DailyScheduler(config, trader, telegram)
 
-    if args.run_once:
-        logger.info("Running single trading cycle (--run-once)")
-        outcome = await scheduler.run_once_now()
-        if outcome is not None:
-            result, closed = outcome
-            print(trader.format_balance_message(
-                result.available_balance,
-                config.trading.settle_coin,
-                config.bybit.mode,
-                closed,
-            ))
-            print()
-            print(trader.format_cycle_result_message(result, config))
-        return
-
+    # Запускаем шедулер задач
     scheduler.start()
 
     try:
-        await telegram.run_polling()
+        # Инициализируем и запускаем Telegram приложение и пуллет
+        await telegram.app.initialize()
+        await telegram.app.start()
+        await telegram.send_startup_notification()
+        await telegram.app.updater.start_polling()
+        logger.info("Telegram bot polling started successfully.")
+
+        # Удерживаем приложение работающим бесконечно
+        while True:
+            await asyncio.sleep(3600)
+
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("Shutting down gracefully...")
     finally:
         scheduler.shutdown()
-
+        await telegram.app.updater.stop()
+        await telegram.app.stop()
+        await telegram.app.shutdown()
+        logger.info("Bot stopped.")
 
 def main() -> None:
     _configure_stdout()
@@ -85,7 +78,6 @@ def main() -> None:
     except Exception:
         logger.exception("Fatal error")
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
