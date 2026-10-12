@@ -23,6 +23,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_CONFIG_PATH,
         help="Path to config.yaml",
     )
+    parser.add_argument(
+        "--test-signal",
+        type=str,
+        choices=["long", "short"],
+        help="Тестовый прогон сигнала: имитировать срабатывание для 'long' или 'short'",
+    )
     return parser.parse_args()
 
 def _configure_stdout() -> None:
@@ -40,20 +46,32 @@ async def main_async() -> None:
     client = BybitClient.from_app_config(config)
     trader = Trader(config, client)
     telegram = TelegramService(config, client, trader)
-    scheduler = DailyScheduler(config, trader, telegram)
 
-    # Запускаем шедулер задач
+    # Если передан флаг тестового прогона
+    if args.test_signal:
+        logger.info(f"Running TEST SIGNAL for: {args.test_signal.upper()}")
+        await telegram.app.initialize()
+        await telegram.app.start()
+        
+        messages = trader.process_trading_logic(test_signal=args.test_signal)
+        for msg in messages:
+            print(msg)
+            await telegram.send_message(f"🧪 **[ТЕСТОВЫЙ ПРОГОН]**\n{msg}")
+        
+        await telegram.app.stop()
+        return
+
+    # Штатный режим работы с планировщиком
+    scheduler = DailyScheduler(config, trader, telegram)
     scheduler.start()
 
     try:
-        # Инициализируем и запускаем Telegram приложение и пуллет
         await telegram.app.initialize()
         await telegram.app.start()
         await telegram.send_startup_notification()
         await telegram.app.updater.start_polling()
         logger.info("Telegram bot polling started successfully.")
 
-        # Удерживаем приложение работающим бесконечно
         while True:
             await asyncio.sleep(3600)
 

@@ -17,52 +17,28 @@ class DailyScheduler:
         self.scheduler = AsyncIOScheduler()
 
     def start(self) -> None:
-        t_conf = self.config.trading
-        
-        # 1. Часовой алгоритм (пункты 4-5)
+        # Запуск каждый день в 23:59:30 UTC (за 30 секунд до закрытия дневной свечи в 00:00 UTC)
         self.scheduler.add_job(
-            self._job_hourly,
+            self._job_daily_close,
             "cron",
-            minute=t_conf.schedule_minute,
-            second=t_conf.schedule_second,
-            id="hourly_trading_job",
+            hour=23,
+            minute=59,
+            second=30,
+            id="daily_close_trading_job",
             replace_existing=True,
         )
-
-        # 2. Минутный мониторинг (пункт 6 и далее)
-        self.scheduler.add_job(
-            self._job_minute,
-            "cron",
-            second=0,
-            id="minute_monitoring_job",
-            replace_existing=True,
-        )
-
         self.scheduler.start()
-        logger.info(
-            f"Scheduler started. Hourly job set at :59:30. Minute job set every minute."
-        )
+        logger.info("Scheduler started. Daily job set at 23:59:30 UTC.")
 
-    async def _job_hourly(self) -> None:
-        logger.info("Running hourly trading check...")
+    async def _job_daily_close(self) -> None:
+        logger.info("Running daily candle close algorithm...")
         try:
-            messages = await asyncio.to_thread(self.trader.run_hourly_check)
+            messages = await asyncio.to_thread(self.trader.process_trading_logic, None)
             for msg in messages:
                 await self.telegram.send_message(msg)
         except Exception as e:
-            err_msg = f"❌ **Ошибка в часовом алгоритме:**\n`{type(e).__name__}: {e}`"
-            logger.exception("Error in hourly job")
-            await self.telegram.send_message(err_msg)
-
-    async def _job_minute(self) -> None:
-        logger.info("Running minute monitoring check...")
-        try:
-            messages = await asyncio.to_thread(self.trader.run_minute_check)
-            for msg in messages:
-                await self.telegram.send_message(msg)
-        except Exception as e:
-            err_msg = f"❌ **Ошибка в минутном мониторинге:**\n`{type(e).__name__}: {e}`"
-            logger.exception("Error in minute job")
+            err_msg = f"❌ **Ошибка в ежедневном алгоритме:**\n`{type(e).__name__}: {e}`"
+            logger.exception("Error in daily job")
             await self.telegram.send_message(err_msg)
 
     def shutdown(self) -> None:

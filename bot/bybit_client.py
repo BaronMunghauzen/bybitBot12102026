@@ -40,7 +40,7 @@ class BybitClient:
         coins = list_acc[0].get("coin", [])
         for c in coins:
             if c.get("coin") == coin:
-                return float(c.get("equity", 0.0) or 0.0)
+                return float(c.get("walletBalance", 0.0) or c.get("equity", 0.0) or 0.0)
         return 0.0
 
     def get_ticker_price(self, symbol: str) -> float:
@@ -53,7 +53,7 @@ class BybitClient:
             return float(list_t[0].get("lastPrice", 0.0))
         return 0.0
 
-    def get_klines(self, symbol: str, interval: str = "60", limit: int = 600) -> List[Dict[str, Any]]:
+    def get_klines(self, symbol: str, interval: str = "D", limit: int = 5) -> List[Dict[str, Any]]:
         resp = self.session.get_kline(
             category="linear",
             symbol=symbol,
@@ -61,10 +61,44 @@ class BybitClient:
             limit=limit,
         )
         list_k = resp.get("result", {}).get("list", [])
-        list_k.reverse() # Chronological order
+        list_k.reverse()
         return list_k
 
-    def set_leverage(self, symbol: str, leverage: int) -> bool:
+    def get_qty_step_and_precision(self, symbol: str) -> tuple[int, float]:
+        try:
+            resp = self.session.get_instruments_info(
+                category="linear",
+                symbol=symbol,
+            )
+            list_i = resp.get("result", {}).get("list", [])
+            if list_i:
+                lot_filter = list_i[0].get("lotSizeFilter", {})
+                step_str = lot_filter.get("qtyStep", "0.01")
+                qty_step = float(step_str)
+                if "." in step_str:
+                    decimals = len(step_str.rstrip("0").split(".")[1])
+                else:
+                    decimals = 0
+                return decimals, qty_step
+        except Exception as e:
+            logger.warning(f"Failed to fetch instrument info for {symbol}: {e}")
+        return 2, 0.01
+
+    def set_margin_mode_and_leverage(self, symbol: str, leverage: int) -> None:
+        try:
+            self.session.switch_margin_mode(
+                category="linear",
+                symbol=symbol,
+                tradeMode=1,
+                buyLeverage=str(leverage),
+                sellLeverage=str(leverage),
+            )
+        except Exception as e:
+            if any(err in str(e) for err in ["110026", "10032", "already", "not supported"]):
+                pass
+            else:
+                logger.warning(f"Margin mode switch notice for {symbol}: {e}")
+
         try:
             self.session.set_leverage(
                 category="linear",
@@ -72,11 +106,9 @@ class BybitClient:
                 buyLeverage=str(leverage),
                 sellLeverage=str(leverage),
             )
-            return True
         except Exception as e:
-            if "110043" in str(e): # Already set
-                return True
-            raise
+            if "110043" not in str(e):
+                logger.warning(f"Leverage set notice for {symbol}: {e}")
 
     def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
         resp = self.session.get_positions(
@@ -96,6 +128,33 @@ class BybitClient:
         )
         return resp.get("result", {}).get("list", [])
 
+    def has_add_been_executed(self, symbol: str, pos_side: str, pos_created_time: int) -> bool:
+        """Проверяет по истории ордеров Bybit, был ли уже совершен докуп для текущей позиции."""
+        try:
+            resp = self.session.get_order_history(
+                category="linear",
+                symbol=symbol,
+                limit=15,
+            )
+            orders = resp.get("result", {}).get("list", [])
+            filled_entries = 0
+            for o in orders:
+                if o.get("orderStatus") == "Filled" and o.get("side") == pos_side:
+                    reduce_only = o.get("reduceOnly", False)
+                    is_reduce = (reduce_only.lower() == "true") if isinstance(reduce_only, str) else bool(reduce_only)
+                    
+                    if not is_reduce:
+                        order_time = int(o.get("createdTime", 0))
+                        # Учитываем ордера, созданные после открытия позиции (с запасом в 5 секунд на рассинхрон)
+                        if order_time >= pos_created_time - 5000:
+                            filled_entries += 1
+            
+            # Если 2 или более исполненных ордеров на вход в ту же сторону — докуп уже был
+            return filled_entries >= 2
+        except Exception as e:
+            logger.warning(f"Failed to check order history for add status on {symbol}: {e}")
+            return False
+
     def place_order(
         self,
         symbol: str,
@@ -103,8 +162,7 @@ class BybitClient:
         order_type: str,
         qty: str,
         price: Optional[str] = None,
-        stop_loss: Optional[str] = None,
-        reduce_only: bool = False,
+        take_profit: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         kwargs: Dict[str, Any] = {
             "category": "linear",
@@ -112,48 +170,31 @@ class BybitClient:
             "side": side,
             "orderType": order_type,
             "qty": str(qty),
-            "reduceOnly": reduce_only,
         }
-        if order_type == "Limit" and price:
-            kwargs["price"] = str(price)
-        if stop_loss:
-            kwargs["stopLoss"] = str(stop_loss)
+        if order_type == "Limit":
+            if price:
+                kwargs["price"] = str(price)
+            kwargs["timeInForce"] = "GTC"
+        elif order_type == "Market":
+            kwargs["timeInForce"] = "IOC"
+
+        if take_profit:
+            kwargs["takeProfit"] = str(take_profit)
 
         resp = self.session.place_order(**kwargs)
         return resp.get("result")
 
-    def cancel_order(self, symbol: str, order_id: str) -> bool:
-        self.session.cancel_order(
-            category="linear",
-            symbol=symbol,
-            orderId=order_id,
-        )
-        return True
-
-    def cancel_all_orders(self, symbol: str) -> bool:
-        self.session.cancel_all_orders(
-            category="linear",
-            symbol=symbol,
-        )
-        return True
-
     def amend_order_trading_stop(
         self,
         symbol: str,
-        stop_loss: Optional[str] = None,
-        trailing_stop: Optional[str] = None,
-        active_price: Optional[str] = None,
+        take_profit: Optional[str] = None,
     ) -> bool:
         kwargs: Dict[str, Any] = {
             "category": "linear",
             "symbol": symbol,
         }
-        if stop_loss is not None:
-            kwargs["stopLoss"] = str(stop_loss)
-        if trailing_stop is not None:
-            kwargs["trailingStop"] = str(trailing_stop)
-        if active_price is not None:
-            kwargs["activePrice"] = str(active_price)
+        if take_profit is not None:
+            kwargs["takeProfit"] = str(take_profit)
 
         self.session.set_trading_stop(**kwargs)
         return True

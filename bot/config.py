@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 import yaml
 
 DEFAULT_CONFIG_PATH = Path("config.yaml")
@@ -18,17 +18,11 @@ class BybitConfig:
 class TradingConfig:
     category: str = "linear"
     settle_coin: str = "USDT"
-    risk_per_trade_pct: Optional[float] = None
     leverage: int = 50
-    symbols: List[str] = field(default_factory=lambda: ["DOGEUSDT"])
-    initial_size_mult: float = 5.0
-    ma_fast: int = 100
-    ma_slow: int = 500
-    max_add_orders: int = 5
-    initial_stop_loss_pct: float = 1.5
-    trailing_stop_pct: float = 1.0
-    schedule_minute: int = 59
-    schedule_second: int = 30
+    symbols: List[str] = field(default_factory=lambda: ["TAOUSDT"])
+    initial_size_mult: float = 10.0
+    take_profit_pct: float = 0.8
+    max_add_orders: int = 1
 
 @dataclass
 class TelegramConfig:
@@ -70,17 +64,11 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
         trading=TradingConfig(
             category=trading_raw.get("category", "linear"),
             settle_coin=trading_raw.get("settle_coin", "USDT"),
-            risk_per_trade_pct=trading_raw.get("risk_per_trade_pct"),
             leverage=int(trading_raw.get("leverage", 50)),
-            symbols=trading_raw.get("symbols", ["DOGEUSDT"]),
-            initial_size_mult=float(trading_raw.get("initial_size_mult", 5.0)),
-            ma_fast=int(trading_raw.get("ma_fast", 100)),
-            ma_slow=int(trading_raw.get("ma_slow", 500)),
-            max_add_orders=int(trading_raw.get("max_add_orders", 5)),
-            initial_stop_loss_pct=float(trading_raw.get("initial_stop_loss_pct", 1.5)),
-            trailing_stop_pct=float(trading_raw.get("trailing_stop_pct", 1.0)),
-            schedule_minute=int(trading_raw.get("schedule_minute", 59)),
-            schedule_second=int(trading_raw.get("schedule_second", 30)),
+            symbols=trading_raw.get("symbols", ["TAOUSDT"]),
+            initial_size_mult=float(trading_raw.get("initial_size_mult", 10.0)),
+            take_profit_pct=float(trading_raw.get("take_profit_pct", 0.8)),
+            max_add_orders=int(trading_raw.get("max_add_orders", 1)),
         ),
         telegram=TelegramConfig(
             bot_token=telegram_raw.get("bot_token", ""),
