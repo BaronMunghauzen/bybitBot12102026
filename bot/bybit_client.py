@@ -129,7 +129,6 @@ class BybitClient:
         return resp.get("result", {}).get("list", [])
 
     def has_add_been_executed(self, symbol: str, pos_side: str, pos_created_time: int) -> bool:
-        """Проверяет по истории ордеров Bybit, был ли уже совершен докуп для текущей позиции."""
         try:
             resp = self.session.get_order_history(
                 category="linear",
@@ -145,11 +144,8 @@ class BybitClient:
                     
                     if not is_reduce:
                         order_time = int(o.get("createdTime", 0))
-                        # Учитываем ордера, созданные после открытия позиции (с запасом в 5 секунд на рассинхрон)
                         if order_time >= pos_created_time - 5000:
                             filled_entries += 1
-            
-            # Если 2 или более исполненных ордеров на вход в ту же сторону — докуп уже был
             return filled_entries >= 2
         except Exception as e:
             logger.warning(f"Failed to check order history for add status on {symbol}: {e}")
@@ -163,6 +159,7 @@ class BybitClient:
         qty: str,
         price: Optional[str] = None,
         take_profit: Optional[str] = None,
+        stop_loss: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         kwargs: Dict[str, Any] = {
             "category": "linear",
@@ -180,6 +177,8 @@ class BybitClient:
 
         if take_profit:
             kwargs["takeProfit"] = str(take_profit)
+        if stop_loss:
+            kwargs["stopLoss"] = str(stop_loss)
 
         resp = self.session.place_order(**kwargs)
         return resp.get("result")

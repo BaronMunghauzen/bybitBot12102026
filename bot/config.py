@@ -23,6 +23,9 @@ class TradingConfig:
     initial_size_mult: float = 10.0
     take_profit_pct: float = 0.8
     max_add_orders: int = 1
+    hourly_enabled: bool = True
+    hourly_take_profit_pct: float = 0.5
+    hourly_stop_loss_pct: float = 1.0
 
 @dataclass
 class SchedulerConfig:
@@ -30,6 +33,8 @@ class SchedulerConfig:
     minute: int = 59
     second: int = 30
     timezone: str = "UTC"
+    hourly_minute: int = 59
+    hourly_second: int = 30
 
 @dataclass
 class TelegramConfig:
@@ -78,12 +83,17 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
             initial_size_mult=float(trading_raw.get("initial_size_mult", 10.0)),
             take_profit_pct=float(trading_raw.get("take_profit_pct", 0.8)),
             max_add_orders=int(trading_raw.get("max_add_orders", 1)),
+            hourly_enabled=bool(trading_raw.get("hourly_enabled", True)),
+            hourly_take_profit_pct=float(trading_raw.get("hourly_take_profit_pct", 0.5)),
+            hourly_stop_loss_pct=float(trading_raw.get("hourly_stop_loss_pct", 1.0)),
         ),
         scheduler=SchedulerConfig(
             hour=int(scheduler_raw.get("hour", 23)),
             minute=int(scheduler_raw.get("minute", 59)),
             second=int(scheduler_raw.get("second", 30)),
             timezone=str(scheduler_raw.get("timezone", "UTC")),
+            hourly_minute=int(scheduler_raw.get("hourly_minute", 59)),
+            hourly_second=int(scheduler_raw.get("hourly_second", 30)),
         ),
         telegram=TelegramConfig(
             bot_token=telegram_raw.get("bot_token", ""),

@@ -14,22 +14,21 @@ class Trader:
     def format_startup_message(self) -> str:
         t = self.config.trading
         return (
-            "🤖 **Торговый бот запущен (Анализ состояния по API Bybit)**\n\n"
+            "🤖 **Торговый бот запущен (Суточный + Часовой алгоритмы)**\n\n"
             "⚙️ **Параметры:**\n"
             f"• Плечо: {t.leverage}x (Изолированная маржа)\n"
             f"• Список активов: {', '.join(t.symbols)}\n"
-            f"• Коэффициент первого входа: {t.initial_size_mult}x\n"
-            f"• Тейк-профит: {t.take_profit_pct}%\n"
-            f"• Максимум докупов: {t.max_add_orders}\n"
-            "• Время срабатывания: за 30 секунд до закрытия дневной свечи (23:59:30 UTC)\n"
+            f"• Коэффициент входа: {t.initial_size_mult}x\n"
+            f"• Суточный ТП: {t.take_profit_pct}%\n"
+            f"• Часовой ТП: {t.hourly_take_profit_pct}% | Стоп-лосс: {t.hourly_stop_loss_pct}%\n"
         )
 
     def process_trading_logic(self, test_signal: Optional[str] = None) -> List[str]:
+        """Суточный алгоритм (срабатывает перед закрытием дневной свечи)"""
         messages = []
         t_conf = self.config.trading
         equity = self.client.get_wallet_balance(t_conf.settle_coin)
         if equity <= 0:
-            logger.warning("Wallet balance is 0 or unable to fetch. Using fallback for tests.")
             equity = 100.0
 
         for symbol in t_conf.symbols:
@@ -40,9 +39,7 @@ class Trader:
                 continue
 
             decimals, qty_step = self.client.get_qty_step_and_precision(symbol)
-
-            is_bullish = False
-            is_bearish = False
+            is_bullish, is_bearish = False, False
 
             if test_signal:
                 if test_signal.lower() == "long":
@@ -52,113 +49,119 @@ class Trader:
             else:
                 klines = self.client.get_klines(symbol, interval="D", limit=2)
                 if not klines:
-                    logger.warning(f"No klines for {symbol}")
                     continue
                 candle = klines[-1]
-                open_p = float(candle[1])
-                close_p = float(candle[4])
-                is_bullish = close_p > open_p
-                is_bearish = close_p < open_p
+                is_bullish = float(candle[4]) > float(candle[1])
+                is_bearish = float(candle[4]) < float(candle[1])
 
             notional = equity * t_conf.initial_size_mult
             qty_raw = notional / last_price
+            qty_val = round(round(qty_raw / qty_step) * qty_step, decimals) if qty_step > 0 else round(qty_raw, decimals)
+            qty = str(int(qty_val)) if decimals == 0 else f"{qty_val:.{decimals}f}"
 
-            if qty_step > 0:
-                qty_val = round(round(qty_raw / qty_step) * qty_step, decimals)
-            else:
-                qty_val = round(qty_raw, decimals)
-
-            if decimals == 0:
-                qty = str(int(qty_val))
-            else:
-                qty = f"{qty_val:.{decimals}f}"
-
-            # Если позиция ОТСУТСТВУЕТ
             if pos is None:
                 if is_bullish:
-                    side = "Buy"
                     tp_price = last_price * (1.0 + t_conf.take_profit_pct / 100.0)
-                    order_res = self.client.place_order(
-                        symbol=symbol,
-                        side=side,
-                        order_type="Market",
-                        qty=qty,
-                        take_profit=str(round(tp_price, 4)),
-                    )
-                    if order_res:
-                        msg = (
-                            f"🟢 **Открыта Лонг сделка по рынку ({symbol})** [Сигнал: Бычья свеча]\n"
-                            f"• Объем: {qty} (Коэфф: {t_conf.initial_size_mult}x, Плечо: {t_conf.leverage}x)\n"
-                            f"• Тейк-профит: {round(tp_price, 4)} (+{t_conf.take_profit_pct}%)"
-                        )
-                        messages.append(msg)
-                        logger.info(msg)
-
+                    if self.client.place_order(symbol=symbol, side="Buy", order_type="Market", qty=qty, take_profit=str(round(tp_price, 4))):
+                        messages.append(f"🟢 **[Суточный] Лонг ({symbol})** | ТП: {round(tp_price, 4)}")
                 elif is_bearish:
-                    side = "Sell"
                     tp_price = last_price * (1.0 - t_conf.take_profit_pct / 100.0)
-                    order_res = self.client.place_order(
-                        symbol=symbol,
-                        side=side,
-                        order_type="Market",
-                        qty=qty,
-                        take_profit=str(round(tp_price, 4)),
-                    )
-                    if order_res:
-                        msg = (
-                            f"🔴 **Открыта Шорт сделка по рынку ({symbol})** [Сигнал: Медвежья свеча]\n"
-                            f"• Объем: {qty} (Коэфф: {t_conf.initial_size_mult}x, Плечо: {t_conf.leverage}x)\n"
-                            f"• Тейк-профит: {round(tp_price, 4)} (-{t_conf.take_profit_pct}%)"
-                        )
-                        messages.append(msg)
-                        logger.info(msg)
-
-            # Если позиция УЖЕ СУЩЕСТВУЕТ — проверяем статус докупа прямо по данным Bybit
+                    if self.client.place_order(symbol=symbol, side="Sell", order_type="Market", qty=qty, take_profit=str(round(tp_price, 4))):
+                        messages.append(f"🔴 **[Суточный] Шорт ({symbol})** | ТП: {round(tp_price, 4)}")
             else:
                 pos_side = pos.get("side")
-                pos_created_time = int(pos.get("createdTime", 0))
-                
-                # Запрашиваем у Bybit, был ли уже докуп для этой активной позиции
-                already_added = self.client.has_add_been_executed(symbol, pos_side, pos_created_time)
-
+                already_added = self.client.has_add_been_executed(symbol, pos_side, int(pos.get("createdTime", 0)))
                 if pos_side == "Buy" and is_bullish and not already_added:
-                    order_res = self.client.place_order(
-                        symbol=symbol,
-                        side="Buy",
-                        order_type="Market",
-                        qty=qty,
-                    )
-                    if order_res:
-                        avg_price = float(pos.get("avgPrice", last_price))
-                        new_tp = avg_price * (1.0 + t_conf.take_profit_pct / 100.0)
+                    if self.client.place_order(symbol=symbol, side="Buy", order_type="Market", qty=qty):
+                        new_tp = float(pos.get("avgPrice", last_price)) * (1.0 + t_conf.take_profit_pct / 100.0)
                         self.client.amend_order_trading_stop(symbol=symbol, take_profit=str(round(new_tp, 4)))
-
-                        msg = (
-                            f"📈 **Докуп Лонг позиции по рынку выполнен ({symbol})**\n"
-                            f"• Объем докупа: {qty}\n"
-                            f"• Новый Тейк-профит: {round(new_tp, 4)} (+{t_conf.take_profit_pct}% от средней)"
-                        )
-                        messages.append(msg)
-                        logger.info(msg)
-
+                        messages.append(f"📈 **[Суточный] Докуп Лонг ({symbol})**")
                 elif pos_side == "Sell" and is_bearish and not already_added:
-                    order_res = self.client.place_order(
-                        symbol=symbol,
-                        side="Sell",
-                        order_type="Market",
-                        qty=qty,
-                    )
-                    if order_res:
-                        avg_price = float(pos.get("avgPrice", last_price))
-                        new_tp = avg_price * (1.0 - t_conf.take_profit_pct / 100.0)
+                    if self.client.place_order(symbol=symbol, side="Sell", order_type="Market", qty=qty):
+                        new_tp = float(pos.get("avgPrice", last_price)) * (1.0 - t_conf.take_profit_pct / 100.0)
                         self.client.amend_order_trading_stop(symbol=symbol, take_profit=str(round(new_tp, 4)))
+                        messages.append(f"📉 **[Суточный] Докуп Шорт ({symbol})**")
 
-                        msg = (
-                            f"📉 **Докуп Шорт позиции по рынку выполнен ({symbol})**\n"
-                            f"• Объем докупа: {qty}\n"
-                            f"• Новый Тейк-профит: {round(new_tp, 4)} (-{t_conf.take_profit_pct}% от средней)"
-                        )
-                        messages.append(msg)
-                        logger.info(msg)
+        return messages
+
+    def process_hourly_trading_logic(self) -> List[str]:
+        """Часовой алгоритм (срабатывает каждый час в 59 минут 30 секунд)"""
+        messages = []
+        t_conf = self.config.trading
+        if not t_conf.hourly_enabled:
+            return messages
+
+        equity = self.client.get_wallet_balance(t_conf.settle_coin)
+        if equity <= 0:
+            equity = 100.0
+
+        for symbol in t_conf.symbols:
+            self.client.set_margin_mode_and_leverage(symbol, t_conf.leverage)
+            pos = self.client.get_position(symbol)
+            
+            # ЕСЛИ УЖЕ ЕСТЬ АКТИВНАЯ СДЕЛКА — НИЧЕГО НЕ ДЕЛАЕМ
+            if pos is not None:
+                continue
+
+            last_price = self.client.get_ticker_price(symbol)
+            if last_price <= 0:
+                continue
+
+            decimals, qty_step = self.client.get_qty_step_and_precision(symbol)
+
+            # Анализ часовой свечи (interval="60")
+            klines = self.client.get_klines(symbol, interval="60", limit=2)
+            if not klines:
+                continue
+            candle = klines[-1]
+            open_p = float(candle[1])
+            close_p = float(candle[4])
+            is_bullish = close_p > open_p
+            is_bearish = close_p < open_p
+
+            notional = equity * t_conf.initial_size_mult
+            qty_raw = notional / last_price
+            qty_val = round(round(qty_raw / qty_step) * qty_step, decimals) if qty_step > 0 else round(qty_raw, decimals)
+            qty = str(int(qty_val)) if decimals == 0 else f"{qty_val:.{decimals}f}"
+
+            if is_bullish:
+                tp_price = last_price * (1.0 + t_conf.hourly_take_profit_pct / 100.0)
+                sl_price = last_price * (1.0 - t_conf.hourly_stop_loss_pct / 100.0) if t_conf.hourly_stop_loss_pct > 0 else None
+                
+                order_kwargs = {
+                    "symbol": symbol,
+                    "side": "Buy",
+                    "order_type": "Market",
+                    "qty": qty,
+                    "take_profit": str(round(tp_price, 4))
+                }
+                if sl_price:
+                    order_kwargs["stop_loss"] = str(round(sl_price, 4))
+
+                if self.client.place_order(**order_kwargs):
+                    sl_text = f" | СЛ: {round(sl_price, 4)}" if sl_price else ""
+                    msg = f"⏱🟢 **[Часовой] Лонг ({symbol})** | ТП: {round(tp_price, 4)}{sl_text}"
+                    messages.append(msg)
+                    logger.info(msg)
+
+            elif is_bearish:
+                tp_price = last_price * (1.0 - t_conf.hourly_take_profit_pct / 100.0)
+                sl_price = last_price * (1.0 + t_conf.hourly_stop_loss_pct / 100.0) if t_conf.hourly_stop_loss_pct > 0 else None
+                
+                order_kwargs = {
+                    "symbol": symbol,
+                    "side": "Sell",
+                    "order_type": "Market",
+                    "qty": qty,
+                    "take_profit": str(round(tp_price, 4))
+                }
+                if sl_price:
+                    order_kwargs["stop_loss"] = str(round(sl_price, 4))
+
+                if self.client.place_order(**order_kwargs):
+                    sl_text = f" | СЛ: {round(sl_price, 4)}" if sl_price else ""
+                    msg = f"⏱🔴 **[Часовой] Шорт ({symbol})** | ТП: {round(tp_price, 4)}{sl_text}"
+                    messages.append(msg)
+                    logger.info(msg)
 
         return messages

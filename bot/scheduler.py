@@ -19,7 +19,7 @@ class DailyScheduler:
     def start(self) -> None:
         s_conf = self.config.scheduler
         
-        # Берем параметры времени из конфигурационного файла
+        # 1. Суточный алгоритм
         self.scheduler.add_job(
             self._job_daily_close,
             "cron",
@@ -30,9 +30,22 @@ class DailyScheduler:
             id="daily_close_trading_job",
             replace_existing=True,
         )
+
+        # 2. Часовой алгоритм (использует настройки из конфигурации)
+        self.scheduler.add_job(
+            self._job_hourly_close,
+            "cron",
+            minute=s_conf.hourly_minute,
+            second=s_conf.hourly_second,
+            timezone=s_conf.timezone,
+            id="hourly_trading_job",
+            replace_existing=True,
+        )
+
         self.scheduler.start()
         logger.info(
-            f"Scheduler started. Daily job set at {s_conf.hour:02d}:{s_conf.minute:02d}:{s_conf.second:02d} ({s_conf.timezone})."
+            f"Scheduler started. Daily job set at {s_conf.hour:02d}:{s_conf.minute:02d}:{s_conf.second:02d} ({s_conf.timezone}). "
+            f"Hourly job set at minute {s_conf.hourly_minute}, second {s_conf.hourly_second} ({s_conf.timezone})."
         )
 
     async def _job_daily_close(self) -> None:
@@ -42,8 +55,19 @@ class DailyScheduler:
             for msg in messages:
                 await self.telegram.send_message(msg)
         except Exception as e:
-            err_msg = f"❌ **Ошибка в ежедневном алгоритме:**\n`{type(e).__name__}: {e}`"
+            err_msg = f"❌ **Ошибка в суточном алгоритме:**\n`{type(e).__name__}: {e}`"
             logger.exception("Error in daily job")
+            await self.telegram.send_message(err_msg)
+
+    async def _job_hourly_close(self) -> None:
+        logger.info("Running hourly candle close algorithm...")
+        try:
+            messages = await asyncio.to_thread(self.trader.process_hourly_trading_logic)
+            for msg in messages:
+                await self.telegram.send_message(msg)
+        except Exception as e:
+            err_msg = f"❌ **Ошибка в часовом алгоритме:**\n`{type(e).__name__}: {e}`"
+            logger.exception("Error in hourly job")
             await self.telegram.send_message(err_msg)
 
     def shutdown(self) -> None:
