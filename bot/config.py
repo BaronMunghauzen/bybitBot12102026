@@ -25,6 +25,13 @@ class TradingConfig:
     max_add_orders: int = 1
 
 @dataclass
+class SchedulerConfig:
+    hour: int = 23
+    minute: int = 59
+    second: int = 30
+    timezone: str = "UTC"
+
+@dataclass
 class TelegramConfig:
     bot_token: str
     allowed_user_id: int
@@ -41,6 +48,7 @@ class LoggingConfig:
 class AppConfig:
     bybit: BybitConfig
     trading: TradingConfig
+    scheduler: SchedulerConfig
     telegram: TelegramConfig
     logging: LoggingConfig
 
@@ -52,6 +60,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
 
     bybit_raw = raw.get("bybit", {})
     trading_raw = raw.get("trading", {})
+    scheduler_raw = raw.get("scheduler", {})
     telegram_raw = raw.get("telegram", {})
     logging_raw = raw.get("logging", {})
 
@@ -69,6 +78,12 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
             initial_size_mult=float(trading_raw.get("initial_size_mult", 10.0)),
             take_profit_pct=float(trading_raw.get("take_profit_pct", 0.8)),
             max_add_orders=int(trading_raw.get("max_add_orders", 1)),
+        ),
+        scheduler=SchedulerConfig(
+            hour=int(scheduler_raw.get("hour", 23)),
+            minute=int(scheduler_raw.get("minute", 59)),
+            second=int(scheduler_raw.get("second", 30)),
+            timezone=str(scheduler_raw.get("timezone", "UTC")),
         ),
         telegram=TelegramConfig(
             bot_token=telegram_raw.get("bot_token", ""),

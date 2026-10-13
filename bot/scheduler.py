@@ -17,18 +17,23 @@ class DailyScheduler:
         self.scheduler = AsyncIOScheduler()
 
     def start(self) -> None:
-        # Запуск каждый день в 23:59:30 UTC (за 30 секунд до закрытия дневной свечи в 00:00 UTC)
+        s_conf = self.config.scheduler
+        
+        # Берем параметры времени из конфигурационного файла
         self.scheduler.add_job(
             self._job_daily_close,
             "cron",
-            hour=23,
-            minute=59,
-            second=30,
+            hour=s_conf.hour,
+            minute=s_conf.minute,
+            second=s_conf.second,
+            timezone=s_conf.timezone,
             id="daily_close_trading_job",
             replace_existing=True,
         )
         self.scheduler.start()
-        logger.info("Scheduler started. Daily job set at 23:59:30 UTC.")
+        logger.info(
+            f"Scheduler started. Daily job set at {s_conf.hour:02d}:{s_conf.minute:02d}:{s_conf.second:02d} ({s_conf.timezone})."
+        )
 
     async def _job_daily_close(self) -> None:
         logger.info("Running daily candle close algorithm...")
