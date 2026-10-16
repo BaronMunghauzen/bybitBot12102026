@@ -14,7 +14,7 @@ class Trader:
     def format_startup_message(self) -> str:
         t = self.config.trading
         return (
-            "🤖 **Торговый бот запущен (MA фильтры + Усреднение + Очистка лимиток)**\n\n"
+            "🤖 **Торговый бот запущен (Свеча + MA фильтры + Усреднение + Очистка лимиток)**\n\n"
             "⚙️ **Параметры:**\n"
             f"• Плечо: {t.leverage}x (Изолированная маржа)\n"
             f"• Список активов: {', '.join(t.symbols)}\n"
@@ -90,7 +90,7 @@ class Trader:
         return messages
 
     def process_hourly_trading_logic(self, test_signal: Optional[str] = None) -> List[str]:
-        """Часовой алгоритм с поддержкой принудительного теста (test_signal)"""
+        """Часовой алгоритм: цвет свечи (бычья/медвежья) + MA фильтры"""
         messages = []
         t_conf = self.config.trading
         if not t_conf.hourly_enabled and not test_signal:
@@ -104,7 +104,6 @@ class Trader:
             self.client.set_margin_mode_and_leverage(symbol, t_conf.leverage)
             pos = self.client.get_position(symbol)
             
-            # Если есть активная сделка, при обычном запуске пропускаем. При тесте можно снять это ограничение или учесть.
             if pos is not None and not test_signal:
                 continue
 
@@ -129,14 +128,26 @@ class Trader:
                     logger.warning(f"Not enough klines for MA calculation on {symbol}")
                     continue
 
+                candle = klines[-2]
+                open_p = float(candle[1])
+                close_p = float(candle[4])
+                
+                # 1. Проверяем, какая свеча (бычья или медвежья)
+                candle_is_bullish = close_p > open_p
+                candle_is_bearish = close_p < open_p
+
                 closes = [float(k[4]) for k in klines]
                 closes_prev = closes[:-1]
                 ma9_curr = self._calculate_sma(closes, t_conf.ma_fast)
                 ma9_prev = self._calculate_sma(closes_prev, t_conf.ma_fast)
                 ma50_curr = self._calculate_sma(closes, t_conf.ma_slow)
 
-                is_bullish = (last_price < ma50_curr) and (ma9_curr > ma9_prev)
-                is_bearish = (last_price > ma50_curr) and (ma9_curr < ma9_prev)
+                # 2. Дополнительные условия MA поверх направления свечи:
+                # Лонг: свеча бычья AND цена ниже MA50 AND текущая MA9 > предыдущей MA9
+                is_bullish = candle_is_bullish and (last_price < ma50_curr) and (ma9_curr > ma9_prev)
+                
+                # Шорт: свеча медвежья AND цена выше MA50 AND текущая MA9 < предыдущей MA9
+                is_bearish = candle_is_bearish and (last_price > ma50_curr) and (ma9_curr < ma9_prev)
 
             notional = equity * t_conf.initial_size_mult
             qty_raw = notional / last_price
