@@ -31,7 +31,7 @@ class DailyScheduler:
             replace_existing=True,
         )
 
-        # 2. Часовой алгоритм (использует настройки из конфигурации)
+        # 2. Часовой алгоритм
         self.scheduler.add_job(
             self._job_hourly_close,
             "cron",
@@ -42,10 +42,21 @@ class DailyScheduler:
             replace_existing=True,
         )
 
+        # 3. Ежеминутный мониторинг висящих лимитных ордеров
+        self.scheduler.add_job(
+            self._job_minute_check,
+            "cron",
+            second=0,
+            timezone=s_conf.timezone,
+            id="minute_monitoring_job",
+            replace_existing=True,
+        )
+
         self.scheduler.start()
         logger.info(
             f"Scheduler started. Daily job set at {s_conf.hour:02d}:{s_conf.minute:02d}:{s_conf.second:02d} ({s_conf.timezone}). "
-            f"Hourly job set at minute {s_conf.hourly_minute}, second {s_conf.hourly_second} ({s_conf.timezone})."
+            f"Hourly job set at minute {s_conf.hourly_minute}, second {s_conf.hourly_second} ({s_conf.timezone}). "
+            f"Minute monitoring enabled."
         )
 
     async def _job_daily_close(self) -> None:
@@ -69,6 +80,12 @@ class DailyScheduler:
             err_msg = f"❌ **Ошибка в часовом алгоритме:**\n`{type(e).__name__}: {e}`"
             logger.exception("Error in hourly job")
             await self.telegram.send_message(err_msg)
+
+    async def _job_minute_check(self) -> None:
+        try:
+            await asyncio.to_thread(self.trader.process_minute_monitoring)
+        except Exception as e:
+            logger.exception("Error in minute monitoring job")
 
     def shutdown(self) -> None:
         self.scheduler.shutdown()

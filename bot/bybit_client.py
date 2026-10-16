@@ -53,7 +53,7 @@ class BybitClient:
             return float(list_t[0].get("lastPrice", 0.0))
         return 0.0
 
-    def get_klines(self, symbol: str, interval: str = "D", limit: int = 5) -> List[Dict[str, Any]]:
+    def get_klines(self, symbol: str, interval: str = "D", limit: int = 100) -> List[Dict[str, Any]]:
         resp = self.session.get_kline(
             category="linear",
             symbol=symbol,
@@ -128,6 +128,17 @@ class BybitClient:
         )
         return resp.get("result", {}).get("list", [])
 
+    def cancel_all_orders(self, symbol: str) -> bool:
+        try:
+            self.session.cancel_all_orders(
+                category="linear",
+                symbol=symbol,
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to cancel orders for {symbol}: {e}")
+            return False
+
     def has_add_been_executed(self, symbol: str, pos_side: str, pos_created_time: int) -> bool:
         try:
             resp = self.session.get_order_history(
@@ -177,6 +188,10 @@ class BybitClient:
 
         if take_profit:
             kwargs["takeProfit"] = str(take_profit)
+        if stop_loss:
+            kwargs["stop_loss" if "stop_loss" in kwargs else "stopLoss"] = str(stop_loss) # совместимость с pybit
+
+        # Исправление именования stopLoss для pybit
         if stop_loss:
             kwargs["stopLoss"] = str(stop_loss)
 

@@ -25,7 +25,10 @@ class TradingConfig:
     max_add_orders: int = 1
     hourly_enabled: bool = True
     hourly_take_profit_pct: float = 0.5
-    hourly_stop_loss_pct: float = 1.0
+    hourly_stop_loss_pct: float = 0.0
+    hourly_add_order_drop_pct: float = 7.0
+    ma_fast: int = 9
+    ma_slow: int = 50
 
 @dataclass
 class SchedulerConfig:
@@ -85,7 +88,10 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
             max_add_orders=int(trading_raw.get("max_add_orders", 1)),
             hourly_enabled=bool(trading_raw.get("hourly_enabled", True)),
             hourly_take_profit_pct=float(trading_raw.get("hourly_take_profit_pct", 0.5)),
-            hourly_stop_loss_pct=float(trading_raw.get("hourly_stop_loss_pct", 1.0)),
+            hourly_stop_loss_pct=float(trading_raw.get("hourly_stop_loss_pct", 0.0)),
+            hourly_add_order_drop_pct=float(trading_raw.get("hourly_add_order_drop_pct", 7.0)),
+            ma_fast=int(trading_raw.get("ma_fast", 9)),
+            ma_slow=int(trading_raw.get("ma_slow", 50)),
         ),
         scheduler=SchedulerConfig(
             hour=int(scheduler_raw.get("hour", 23)),

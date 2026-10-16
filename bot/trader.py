@@ -14,17 +14,22 @@ class Trader:
     def format_startup_message(self) -> str:
         t = self.config.trading
         return (
-            "🤖 **Торговый бот запущен (Суточный + Часовой алгоритмы)**\n\n"
+            "🤖 **Торговый бот запущен (MA фильтры + Усреднение + Очистка лимиток)**\n\n"
             "⚙️ **Параметры:**\n"
             f"• Плечо: {t.leverage}x (Изолированная маржа)\n"
             f"• Список активов: {', '.join(t.symbols)}\n"
-            f"• Коэффициент входа: {t.initial_size_mult}x\n"
-            f"• Суточный ТП: {t.take_profit_pct}%\n"
             f"• Часовой ТП: {t.hourly_take_profit_pct}% | Стоп-лосс: {t.hourly_stop_loss_pct}%\n"
+            f"• Просадка для лимитного докупа: {t.hourly_add_order_drop_pct}%\n"
+            f"• MA фильтры: Быстрая MA={t.ma_fast}, Длинная MA={t.ma_slow}\n"
         )
 
+    def _calculate_sma(self, closes: List[float], period: int) -> float:
+        if len(closes) < period:
+            return sum(closes) / len(closes) if closes else 0.0
+        return sum(closes[-period:]) / period
+
     def process_trading_logic(self, test_signal: Optional[str] = None) -> List[str]:
-        """Суточный алгоритм (срабатывает перед закрытием дневной свечи)"""
+        """Суточный алгоритм"""
         messages = []
         t_conf = self.config.trading
         equity = self.client.get_wallet_balance(t_conf.settle_coin)
@@ -84,11 +89,11 @@ class Trader:
 
         return messages
 
-    def process_hourly_trading_logic(self) -> List[str]:
-        """Часовой алгоритм (срабатывает каждый час в 59 минут 30 секунд)"""
+    def process_hourly_trading_logic(self, test_signal: Optional[str] = None) -> List[str]:
+        """Часовой алгоритм с поддержкой принудительного теста (test_signal)"""
         messages = []
         t_conf = self.config.trading
-        if not t_conf.hourly_enabled:
+        if not t_conf.hourly_enabled and not test_signal:
             return messages
 
         equity = self.client.get_wallet_balance(t_conf.settle_coin)
@@ -99,8 +104,8 @@ class Trader:
             self.client.set_margin_mode_and_leverage(symbol, t_conf.leverage)
             pos = self.client.get_position(symbol)
             
-            # ЕСЛИ УЖЕ ЕСТЬ АКТИВНАЯ СДЕЛКА — НИЧЕГО НЕ ДЕЛАЕМ
-            if pos is not None:
+            # Если есть активная сделка, при обычном запуске пропускаем. При тесте можно снять это ограничение или учесть.
+            if pos is not None and not test_signal:
                 continue
 
             last_price = self.client.get_ticker_price(symbol)
@@ -109,15 +114,29 @@ class Trader:
 
             decimals, qty_step = self.client.get_qty_step_and_precision(symbol)
 
-            # Анализ часовой свечи (interval="60")
-            klines = self.client.get_klines(symbol, interval="60", limit=2)
-            if not klines:
-                continue
-            candle = klines[-1]
-            open_p = float(candle[1])
-            close_p = float(candle[4])
-            is_bullish = close_p > open_p
-            is_bearish = close_p < open_p
+            is_bullish = False
+            is_bearish = False
+
+            if test_signal:
+                if test_signal.lower() == "long":
+                    is_bullish = True
+                elif test_signal.lower() == "short":
+                    is_bearish = True
+            else:
+                limit_candles = max(t_conf.ma_slow + 5, 60)
+                klines = self.client.get_klines(symbol, interval="60", limit=limit_candles)
+                if not klines or len(klines) < t_conf.ma_slow + 2:
+                    logger.warning(f"Not enough klines for MA calculation on {symbol}")
+                    continue
+
+                closes = [float(k[4]) for k in klines]
+                closes_prev = closes[:-1]
+                ma9_curr = self._calculate_sma(closes, t_conf.ma_fast)
+                ma9_prev = self._calculate_sma(closes_prev, t_conf.ma_fast)
+                ma50_curr = self._calculate_sma(closes, t_conf.ma_slow)
+
+                is_bullish = (last_price < ma50_curr) and (ma9_curr > ma9_prev)
+                is_bearish = (last_price > ma50_curr) and (ma9_curr < ma9_prev)
 
             notional = equity * t_conf.initial_size_mult
             qty_raw = notional / last_price
@@ -138,9 +157,21 @@ class Trader:
                 if sl_price:
                     order_kwargs["stop_loss"] = str(round(sl_price, 4))
 
-                if self.client.place_order(**order_kwargs):
-                    sl_text = f" | СЛ: {round(sl_price, 4)}" if sl_price else ""
-                    msg = f"⏱🟢 **[Часовой] Лонг ({symbol})** | ТП: {round(tp_price, 4)}{sl_text}"
+                res = self.client.place_order(**order_kwargs)
+                if res:
+                    if t_conf.hourly_stop_loss_pct <= 0 and t_conf.hourly_add_order_drop_pct > 0:
+                        add_price = last_price * (1.0 - t_conf.hourly_add_order_drop_pct / 100.0)
+                        self.client.place_order(
+                            symbol=symbol,
+                            side="Buy",
+                            order_type="Limit",
+                            qty=qty,
+                            price=str(round(add_price, 4))
+                        )
+
+                    prefix = "[ТЕСТ / Часовой Лонг]" if test_signal else "[Часовой Лонг]"
+                    sl_text = f" | СЛ: {round(sl_price, 4)}" if sl_price else " | Лимитка усреднения выставлена"
+                    msg = f"⏱🟢 **{prefix} ({symbol})** | ТП: {round(tp_price, 4)}{sl_text}"
                     messages.append(msg)
                     logger.info(msg)
 
@@ -158,10 +189,33 @@ class Trader:
                 if sl_price:
                     order_kwargs["stop_loss"] = str(round(sl_price, 4))
 
-                if self.client.place_order(**order_kwargs):
-                    sl_text = f" | СЛ: {round(sl_price, 4)}" if sl_price else ""
-                    msg = f"⏱🔴 **[Часовой] Шорт ({symbol})** | ТП: {round(tp_price, 4)}{sl_text}"
+                res = self.client.place_order(**order_kwargs)
+                if res:
+                    if t_conf.hourly_stop_loss_pct <= 0 and t_conf.hourly_add_order_drop_pct > 0:
+                        add_price = last_price * (1.0 + t_conf.hourly_add_order_drop_pct / 100.0)
+                        self.client.place_order(
+                            symbol=symbol,
+                            side="Sell",
+                            order_type="Limit",
+                            qty=qty,
+                            price=str(round(add_price, 4))
+                        )
+
+                    prefix = "[ТЕСТ / Часовой Шорт]" if test_signal else "[Часовой Шорт]"
+                    sl_text = f" | СЛ: {round(sl_price, 4)}" if sl_price else " | Лимитка усреднения выставлена"
+                    msg = f"⏱🔴 **{prefix} ({symbol})** | ТП: {round(tp_price, 4)}{sl_text}"
                     messages.append(msg)
                     logger.info(msg)
 
         return messages
+
+    def process_minute_monitoring(self) -> None:
+        """Ежеминутная проверка висящих лимитных ордеров"""
+        t_conf = self.config.trading
+        for symbol in t_conf.symbols:
+            pos = self.client.get_position(symbol)
+            if pos is None:
+                open_orders = self.client.get_open_orders(symbol)
+                if open_orders:
+                    logger.info(f"Position for {symbol} is closed, but open orders found. Cancelling remaining orders.")
+                    self.client.cancel_all_orders(symbol)

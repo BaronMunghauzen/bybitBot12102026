@@ -1,49 +1,61 @@
 from __future__ import annotations
 
 import logging
-from telegram.ext import Application
-from telegram.request import HTTPXRequest
-from bot.bybit_client import BybitClient
+from telegram.ext import Application, ApplicationBuilder
 from bot.config import AppConfig
-from bot.trader import Trader
 
 logger = logging.getLogger(__name__)
 
 class TelegramService:
-    def __init__(self, config: AppConfig, client: BybitClient, trader: Trader) -> None:
-        self.config = config
-        self.client = client
-        self.trader = trader
+    def __init__(
+        self,
+        token: str,
+        allowed_user_id: int,
+        proxy_host: str = "",
+        proxy_port: int = 0,
+        proxy_username: str = "",
+        proxy_password: str = "",
+    ) -> None:
+        self.token = token
+        self.allowed_user_id = allowed_user_id
+        
+        builder = ApplicationBuilder().token(self.token)
+        
+        if proxy_host and proxy_port:
+            proxy_url = f"http://{proxy_username}:{proxy_password}@{proxy_host}:{proxy_port}" if proxy_username else f"http://{proxy_host}:{proxy_port}"
+            builder.proxy(proxy_url).get_updates_proxy(proxy_url)
+            
+        self.application: Application = builder.build()
 
-        tg = config.telegram
-        builder = Application.builder().token(tg.bot_token)
+    @classmethod
+    def from_app_config(cls, config: AppConfig) -> TelegramService:
+        t = config.telegram
+        return cls(
+            token=t.bot_token,
+            allowed_user_id=t.allowed_user_id,
+            proxy_host=t.proxy_host,
+            proxy_port=t.proxy_port,
+            proxy_username=t.proxy_username,
+            proxy_password=t.proxy_password,
+        )
 
-        if tg.proxy_host and tg.proxy_port:
-            if tg.proxy_username and tg.proxy_password:
-                proxy_url = f"http://{tg.proxy_username}:{tg.proxy_password}@{tg.proxy_host}:{tg.proxy_port}"
-            else:
-                proxy_url = f"http://{tg.proxy_host}:{tg.proxy_port}"
-            request = HTTPXRequest(proxy=proxy_url)
-            builder.request(request)
-
-        self.app = builder.build()
-
-    async def send_startup_notification(self) -> None:
-        chat_id = self.config.telegram.allowed_user_id
-        if not chat_id:
-            return
-        text = self.trader.format_startup_message()
-        try:
-            await self.app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-            logger.info("Startup configuration sent to Telegram.")
-        except Exception as e:
-            logger.error(f"Failed to send startup message to Telegram: {e}")
+    async def initialize(self) -> None:
+        await self.application.initialize()
+        await self.application.start()
 
     async def send_message(self, text: str) -> None:
-        chat_id = self.config.telegram.allowed_user_id
-        if not chat_id or not text:
-            return
         try:
-            await self.app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            await self.application.bot.send_message(
+                chat_id=self.allowed_user_id,
+                text=text,
+                parse_mode="Markdown"
+            )
         except Exception as e:
-            logger.error(f"Failed to send message to Telegram: {e}")
+            logger.error(f"Failed to send Telegram message: {e}")
+
+    async def shutdown(self) -> None:
+        try:
+            await self.application.stop()
+            await self.application.shutdown()
+        except Exception as e:
+            logger.error(f"Error shutting down Telegram service: {e}")
