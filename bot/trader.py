@@ -14,11 +14,12 @@ class Trader:
     def format_startup_message(self) -> str:
         t = self.config.trading
         return (
-            "🤖 **Торговый бот запущен (Свеча + MA фильтры + Усреднение + Очистка лимиток)**\n\n"
+            "🤖 **Торговый бот запущен (Свеча + MA фильтры + Усреднение + Контроль ТП)**\n\n"
             "⚙️ **Параметры:**\n"
             f"• Плечо: {t.leverage}x (Изолированная маржа)\n"
             f"• Список активов: {', '.join(t.symbols)}\n"
-            f"• Часовой ТП: {t.hourly_take_profit_pct}% | Стоп-лосс: {t.hourly_stop_loss_pct}%\n"
+            f"• Суточный алгоритм: {'ВКЛ' if t.daily_enabled else 'ВЫКЛ'}\n"
+            f"• Часовой алгоритм: {'ВКЛ' if t.hourly_enabled else 'ВЫКЛ'} (ТП: {t.hourly_take_profit_pct}%)\n"
             f"• Просадка для лимитного докупа: {t.hourly_add_order_drop_pct}%\n"
             f"• MA фильтры: Быстрая MA={t.ma_fast}, Длинная MA={t.ma_slow}\n"
         )
@@ -32,6 +33,9 @@ class Trader:
         """Суточный алгоритм"""
         messages = []
         t_conf = self.config.trading
+        if not t_conf.daily_enabled and not test_signal:
+            return messages
+
         equity = self.client.get_wallet_balance(t_conf.settle_coin)
         if equity <= 0:
             equity = 100.0
@@ -216,12 +220,32 @@ class Trader:
         return messages
 
     def process_minute_monitoring(self) -> None:
-        """Ежеминутная проверка висящих лимитных ордеров"""
+        """Ежеминутная проверка: очистка висящих лимиток и контроль Take Profit по часовому алгоритму"""
         t_conf = self.config.trading
         for symbol in t_conf.symbols:
             pos = self.client.get_position(symbol)
             if pos is None:
+                # Позиция закрыта — проверяем и отменяем зависшие лимитные ордера
                 open_orders = self.client.get_open_orders(symbol)
                 if open_orders:
                     logger.info(f"Position for {symbol} is closed, but open orders found. Cancelling remaining orders.")
                     self.client.cancel_all_orders(symbol)
+            else:
+                # Позиция активна — проверяем соответствие ТП заданному в настройках часового алгоритма
+                side = pos.get("side")
+                avg_price = float(pos.get("avgPrice", 0.0) or 0.0)
+                current_tp = float(pos.get("takeProfit", 0.0) or 0.0)
+
+                if avg_price > 0 and t_conf.hourly_take_profit_pct > 0:
+                    if side == "Buy":
+                        target_tp = avg_price * (1.0 + t_conf.hourly_take_profit_pct / 100.0)
+                    elif side == "Sell":
+                        target_tp = avg_price * (1.0 - t_conf.hourly_take_profit_pct / 100.0)
+                    else:
+                        continue
+
+                    target_tp_rounded = round(target_tp, 4)
+                    # Если тейк-профит не установлен или отличается от целевого — обновляем его
+                    if current_tp <= 0 or abs(current_tp - target_tp_rounded) > 0.0001:
+                        logger.info(f"Updating Take Profit for {symbol} ({side}). Current: {current_tp}, Target: {target_tp_rounded}")
+                        self.client.amend_order_trading_stop(symbol=symbol, take_profit=str(target_tp_rounded))

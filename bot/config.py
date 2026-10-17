@@ -23,6 +23,7 @@ class TradingConfig:
     initial_size_mult: float = 10.0
     take_profit_pct: float = 0.8
     max_add_orders: int = 1
+    daily_enabled: bool = True
     hourly_enabled: bool = True
     hourly_take_profit_pct: float = 0.5
     hourly_stop_loss_pct: float = 0.0
@@ -86,6 +87,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
             initial_size_mult=float(trading_raw.get("initial_size_mult", 10.0)),
             take_profit_pct=float(trading_raw.get("take_profit_pct", 0.8)),
             max_add_orders=int(trading_raw.get("max_add_orders", 1)),
+            daily_enabled=bool(trading_raw.get("daily_enabled", True)),
             hourly_enabled=bool(trading_raw.get("hourly_enabled", True)),
             hourly_take_profit_pct=float(trading_raw.get("hourly_take_profit_pct", 0.5)),
             hourly_stop_loss_pct=float(trading_raw.get("hourly_stop_loss_pct", 0.0)),

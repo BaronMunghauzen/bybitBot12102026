@@ -42,7 +42,7 @@ class DailyScheduler:
             replace_existing=True,
         )
 
-        # 3. Ежеминутный мониторинг висящих лимитных ордеров
+        # 3. Ежеминутный мониторинг (лимитки + контроль ТП)
         self.scheduler.add_job(
             self._job_minute_check,
             "cron",
@@ -60,6 +60,10 @@ class DailyScheduler:
         )
 
     async def _job_daily_close(self) -> None:
+        if not self.config.trading.daily_enabled:
+            logger.info("Daily trading algorithm is disabled in config. Skipping.")
+            return
+            
         logger.info("Running daily candle close algorithm...")
         try:
             messages = await asyncio.to_thread(self.trader.process_trading_logic, None)
